@@ -188,6 +188,74 @@ class SparseEncoder(CogModule):
         return mask
 
 
+class PredictiveAttention(CogModule):
+    """
+    PHASE 3: Predictive Attention — Hebbian-basierter Aufmerksamkeitsmechanismus.
+    Statt Softmax-Attention wie Transformer, nutzt dies Prediction Error als Attention-Signal.
+    Hoher Error an einer Position -> mehr Aufmerksamkeit für diese Position.
+    """
+    def __init__(self, d_model, n_heads=4):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        # Hebbian attention weights: learn to project error to attention scores
+        self.W_q = nn.Linear(d_model, d_model, bias=False)  # Query projection
+        self.W_k = nn.Linear(d_model, d_model, bias=False)  # Key projection
+        self.W_v = nn.Linear(d_model, d_model, bias=False)  # Value projection
+        self.W_out = nn.Linear(d_model, d_model, bias=False)
+        self._max_weight = 1.0
+        
+    def forward(self, x, error=None, learn=True):
+        """
+        x: input sequence [batch, seq, d_model]
+        error: prediction error for attention modulation [batch, seq, d_model]
+        Returns: attended output [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            batch, seq, d = x.shape
+            
+            # Project to Q, K, V
+            Q = self.W_q(x)  # [batch, seq, d]
+            K = self.W_k(x)  # [batch, seq, d]
+            V = self.W_v(x)  # [batch, seq, d]
+            
+            # Standard attention scores
+            scores = Q @ K.transpose(-2, -1) / (self.head_dim ** 0.5)  # [batch, seq, seq]
+            
+            # PHASE 3: Modulate attention with prediction error
+            if error is not None:
+                # Error magnitude as attention boost
+                error_mag = (error ** 2).sum(dim=-1, keepdim=True)  # [batch, seq, 1]
+                # Boost attention to high-error positions
+                error_boost = error_mag @ error_mag.transpose(-2, -1)  # [batch, seq, seq]
+                scores = scores + error_boost * 0.5  # Modulate with error signal
+            
+            attn = torch.softmax(scores, dim=-1)
+            output = attn @ V  # [batch, seq, d]
+            output = self.W_out(output)
+            
+            return output
+    
+    def learn_step(self, x, error, output, target):
+        """Hebbian learning for attention weights."""
+        # Learn to attend better: minimize difference between attended output and target
+        err = target - output  # [batch, seq, d]
+        
+        # Update W_out
+        e_flat = err.reshape(-1, self.d_model)
+        o_flat = output.reshape(-1, self.d_model)
+        dw_out = (e_flat.T @ o_flat) / e_flat.size(0)
+        
+        if self.W_out.weight not in self._momentum:
+            self._momentum[self.W_out.weight] = dw_out.clone()
+        else:
+            m = self._momentum_factor
+            self._momentum[self.W_out.weight] = m * self._momentum[self.W_out.weight] + (1 - m) * dw_out
+        self.W_out.weight.data.add_(self._momentum[self.W_out.weight], alpha=self._lr * 0.1)
+        self.W_out.weight.data.clamp_(-1.0, 1.0)
+
+
 class PredictiveLayer(CogModule):
     def __init__(self, d_model, d_state=64, d_context=128):
         super().__init__()
@@ -275,20 +343,26 @@ class PredictiveLayer(CogModule):
 
 
 class PredictiveStack(CogModule):
-    def __init__(self, d_model, n_layers=4, d_state=64, d_context=128):
+    def __init__(self, d_model, n_layers=4, d_state=64, d_context=128, n_attention_heads=4):
         super().__init__()
         self.layers = nn.ModuleList([PredictiveLayer(d_model, d_state, d_context) for _ in range(n_layers)])
         self.pred_mixer = nn.Parameter(torch.ones(n_layers) / n_layers)
+        # PHASE 3: Predictive Attention
+        self.attention = PredictiveAttention(d_model, n_heads=n_attention_heads)
 
-    def forward(self, x, context=None, memory_retrieved=None, learn=True):
+    def forward(self, x, context=None, memory_retrieved=None, errors_for_attn=None, learn=True):
         errors, states, preds = [], [], []
         current = x
         for i, layer in enumerate(self.layers):
-            # Inject memory only at first layer
             mem = memory_retrieved if i == 0 else None
             s, e, p = layer(current, context, memory_retrieved=mem, learn=learn)
             errors.append(e); states.append(s); preds.append(p)
-            current = torch.tanh(e)
+            
+            # PHASE 3: Apply attention after each layer
+            if errors_for_attn is not None:
+                current = self.attention(torch.tanh(e), error=errors_for_attn, learn=learn)
+            else:
+                current = torch.tanh(e)
         return errors, states, preds
 
     def mixed_prediction(self, predictions):
@@ -341,8 +415,8 @@ class CogLang:
         m = SensoryInput(vocab_size, d_model); self.modules.append(m); self._sensory = m; return m
     def SparseEncoder(self, input_dim, d_sparse, sparsity=0.02):
         m = SparseEncoder(input_dim, d_sparse, sparsity); self.modules.append(m); self._encoder = m; return m
-    def PredictiveStack(self, d_model, n_layers, d_state, d_context, lr=0.05):
-        m = PredictiveStack(d_model, n_layers, d_state, d_context); self.modules.append(m); self._stack = m
+    def PredictiveStack(self, d_model, n_layers, d_state, d_context, lr=0.05, n_attention_heads=4):
+        m = PredictiveStack(d_model, n_layers, d_state, d_context, n_attention_heads); self.modules.append(m); self._stack = m
         for layer in m.layers: layer._lr = lr
         return m
     def OutputDecoder(self, d_sparse, d_model, vocab_size, lr=0.05):
@@ -380,7 +454,7 @@ class CogLang:
             # Expand to sequence length
             memory_retrieved = memory_retrieved.expand(-1, seq, -1)
         
-        errors, states, predictions = self._stack(sparse_x, context, memory_retrieved=memory_retrieved, learn=learn)
+        errors, states, predictions = self._stack(sparse_x, context, memory_retrieved=memory_retrieved, errors_for_attn=sparse_x, learn=learn)
         pred = self._stack.mixed_prediction(predictions)
         output, hidden = self._decoder(pred)
         return output, {'errors': errors, 'predictions': predictions, 'hidden': hidden, 'pred': pred, 'sparse': sparse_x}
@@ -418,14 +492,14 @@ class CogLang:
         return None
 
 
-def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64):
-    """Anima in CogLang v3 — mit Working Memory."""
+def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4):
+    """Anima in CogLang v3 — mit Working Memory + Predictive Attention."""
     brain = CogLang()
     brain.SensoryInput(vocab_size=vocab_size, d_model=d_model)
     brain.SparseEncoder(input_dim=d_model, d_sparse=d_sparse, sparsity=0.02)
-    brain.PredictiveStack(d_model=d_sparse, n_layers=n_layers, d_state=d_state, d_context=d_context, lr=lr)
+    brain.PredictiveStack(d_model=d_sparse, n_layers=n_layers, d_state=d_state, d_context=d_context, lr=lr, n_attention_heads=n_attention_heads)
     brain.OutputDecoder(d_sparse=d_sparse, d_model=d_model, vocab_size=vocab_size, lr=lr)
     brain.EpisodicMemory(d_model=d_sparse, memory_size=memory_size, target_dim=d_state)
     brain.to(device)
-    print(f'CogLang v3: {brain.parameter_count()/1e6:.1f}M Parameter | d_model={d_model}, n_layers={n_layers}, memory={memory_size}')
+    print(f'CogLang v3: {brain.parameter_count()/1e6:.1f}M Parameter | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn_heads={n_attention_heads}')
     return brain

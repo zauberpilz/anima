@@ -16,7 +16,7 @@ def load_config():
         with open(config_file, 'r') as f:
             return json.load(f)
     else:
-        # Start-Konfiguration (Basis Cobra) - Streaming-optimiert
+        # Start-Konfiguration (SURF MODE - stark gedrosselt)
         return {
             "d_model": 384,
             "d_sparse": 2048,
@@ -24,11 +24,11 @@ def load_config():
             "d_state": 128,
             "d_context": 256,
             "lr": 0.05,
-            "max_vram_mb": 4500,
+            "max_vram_mb": 3000, # Stark reduziert für Surf-Kompatibilität
             "generation_step": 50000,
             "best_loss": float('inf'),
             "iteration": 0,
-            "use_code_data": False  # PHASE 20: Code-Daten aktivieren
+            "use_code_data": False
         }
 
 def save_config(config):
@@ -79,17 +79,24 @@ def run_evolution():
     history = []
     t_start = time.time()
     
-    # PHASE 15: Efficiency Features
+    # PHASE 15: Efficiency Features (SURF MODE)
     steps_per_iter = config['generation_step']
-    batch_sizer = DynamicBatchSizer(initial_batch=8, initial_seq=128, max_vram_mb=config['max_vram_mb'])
+    batch_sizer = DynamicBatchSizer(initial_batch=4, initial_seq=64, max_vram_mb=config['max_vram_mb'])
     B, S = batch_sizer.get_sizes()
-    async_loader = AsyncDataLoader(data, B, S, device, prefetch=4)
+    async_loader = AsyncDataLoader(data, B, S, device, prefetch=2)  # Weniger Prefetch
     async_loader.start()
     
-    # PHASE 17: Resource Throttle für Surf-Kompatibilität
-    # Begrenzt GPU utilization auf ~70% damit Browser-traffic Priorität hat
-    torch.backends.cudnn.benchmark = False  # Weniger VRAM-Spitzen
-    torch.set_num_threads(4)  # CPU Threads begrenzen
+    # PHASE 17: Resource Throttle für Surf-Kompatibilität (STARK GEDROSSELT)
+    torch.backends.cudnn.benchmark = False
+    torch.set_num_threads(2)  # CPU Threads stark begrenzt
+    
+    # PHASE 22: System-Priorität senken (Nice Level 19 = niedrigste Prio)
+    try:
+        os.system("renice -n 19 -p $$ > /dev/null 2>&1")
+        os.system("ionice -c 3 -p $$ > /dev/null 2>&1")  # Idle I/O priority
+        print("[SURF MODE] CPU/IO-Priorität gesenkt für maximale Browser-Performance")
+    except:
+        pass
     
     last_log_time = time.time()
 

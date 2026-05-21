@@ -647,6 +647,64 @@ class NeuroSymbolicBridge(CogModule):
                 self.rule_keys.data.clamp_(-1.0, 1.0)
 
 
+class EvolutionStrategyOptimizer(CogModule):
+    """
+    PHASE 13: Gradient-Free Optimizer — Evolution Strategies für Weight Updates.
+    Statt Hebbian Learning, nutzt dies perturbationsbasierte Optimierung.
+    """
+    def __init__(self, d_model, population_size=8, sigma=0.01):
+        super().__init__()
+        self.d_model = d_model
+        self.population_size = population_size
+        self.sigma = sigma  # Perturbation noise
+        self._best_weights = {}
+        self._best_fitness = float('inf')
+        
+    def perturb_weights(self, model, seed=None):
+        """Erstelle perturbierte Kopie der Gewichte."""
+        if seed is not None:
+            torch.manual_seed(seed)
+        perturbations = {}
+        for name, param in model.named_parameters():
+            noise = torch.randn_like(param.data) * self.sigma
+            perturbations[name] = noise
+        return perturbations
+    
+    def apply_perturbations(self, model, perturbations):
+        """Wende Perturbationen auf Modell an."""
+        for name, param in model.named_parameters():
+            if name in perturbations:
+                param.data.add_(perturbations[name])
+                param.data.clamp_(-self._max_weight, self._max_weight)
+    
+    def update_from_fitness(self, model, perturbations_list, fitness_scores):
+        """Update Gewichte basierend auf Fitness-Scores."""
+        if len(fitness_scores) == 0:
+            return
+            
+        best_idx = torch.argmin(torch.tensor(fitness_scores)).item()
+        best_fitness = fitness_scores[best_idx]
+        
+        if best_fitness < self._best_fitness:
+            self._best_fitness = best_fitness
+            for name, param in model.named_parameters():
+                self._best_weights[name] = param.data.clone()
+        
+        # Weighted update from population
+        fitness_array = torch.tensor(fitness_scores)
+        weights = torch.softmax(-fitness_array, dim=0)  # Lower loss = higher weight
+        
+        for name, param in model.named_parameters():
+            if name in self._best_weights:
+                # Blend towards best with population influence
+                update = torch.zeros_like(param.data)
+                for i, pert in enumerate(perturbations_list):
+                    if name in pert:
+                        update += weights[i] * pert[name]
+                param.data.add_(update, alpha=0.1)
+                param.data.clamp_(-self._max_weight, self._max_weight)
+
+
 class CogLang:
     def __init__(self):
         self.modules = nn.ModuleList()
@@ -674,6 +732,8 @@ class CogLang:
         m = IntrinsicMotivation(d_model); self.modules.append(m); self._motivation = m; return m
     def NeuroSymbolicBridge(self, vocab_size, d_model, n_rules=16):
         m = NeuroSymbolicBridge(vocab_size, d_model, n_rules); self.modules.append(m); self._bridge = m; return m
+    def EvolutionStrategy(self, d_model, population_size=8, sigma=0.01):
+        m = EvolutionStrategyOptimizer(d_model, population_size, sigma); self.modules.append(m); self._es = m; return m
 
     def to(self, device):
         self.modules.to(device)
@@ -757,8 +817,8 @@ class CogLang:
         return None
 
 
-def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4, n_rules=16):
-    """Anima in CogLang v3 — Vollständige AGI Architecture mit allen 8 Phasen."""
+def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4, n_rules=16, es_population=8):
+    """Anima in CogLang v3 — Vollständige AGI Architecture mit allen 13 Phasen."""
     brain = CogLang()
     brain.SensoryInput(vocab_size=vocab_size, d_model=d_model)
     brain.SparseEncoder(input_dim=d_model, d_sparse=d_sparse, sparsity=0.02)
@@ -767,6 +827,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.EpisodicMemory(d_model=d_sparse, memory_size=memory_size, target_dim=d_state)
     brain.IntrinsicMotivation(d_model=d_sparse)
     brain.NeuroSymbolicBridge(vocab_size=vocab_size, d_model=d_sparse, n_rules=n_rules)
+    brain.EvolutionStrategy(d_model=d_sparse, population_size=es_population, sigma=0.01)
     brain.to(device)
-    print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}')
+    print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES_pop={es_population}')
     return brain

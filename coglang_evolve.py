@@ -15,15 +15,15 @@ def load_config():
         with open(config_file, 'r') as f:
             return json.load(f)
     else:
-        # Start-Konfiguration (Basis Cobra)
+        # Start-Konfiguration (Basis Cobra) - Streaming-optimiert
         return {
-            "d_model": 512,
-            "d_sparse": 4096,
-            "n_layers": 8,
-            "d_state": 256,
-            "d_context": 512,
+            "d_model": 384,
+            "d_sparse": 2048,
+            "n_layers": 6,
+            "d_state": 128,
+            "d_context": 256,
             "lr": 0.05,
-            "max_vram_mb": 7000, # Sicherer Puffer für 8GB
+            "max_vram_mb": 4500, # Limit für Streaming-Kompatibilität (3.5GB frei)
             "generation_step": 50000,
             "best_loss": float('inf'),
             "iteration": 0
@@ -61,7 +61,7 @@ def run_evolution():
 
     history = []
     t_start = time.time()
-    B, S = 16, 256 # Optimized: Longer sequences for better context, stable VRAM
+    B, S = 8, 128 # Reduced for streaming compatibility
     steps_per_iter = config['generation_step']
     last_log_time = time.time()
 

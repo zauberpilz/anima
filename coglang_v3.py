@@ -536,6 +536,63 @@ class IntrinsicMotivation(CogModule):
             return intrinsic_reward, curiosity_factor
 
 
+class NeuroSymbolicBridge(CogModule):
+    """
+    PHASE 8: Neuro-Symbolische Brücke — Kombination von Mustern mit logischen Regeln.
+    Erlaubt dem Modell, einfache logische Constraints auf Vorhersagen anzuwenden.
+    """
+    def __init__(self, vocab_size, d_model, n_rules=16):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_rules = n_rules
+        # Rule embeddings: each rule is a pattern in embedding space
+        self.rule_keys = nn.Parameter(torch.randn(n_rules, d_model) * 0.1)
+        self.rule_values = nn.Parameter(torch.randn(n_rules, vocab_size) * 0.1)
+        self._max_weight = 1.0
+        
+    def forward(self, prediction_logits, context_embedding=None):
+        """
+        Apply neuro-symbolic rules to prediction logits.
+        Returns: modulated logits
+        """
+        with torch.no_grad():
+            batch, seq, vocab = prediction_logits.shape
+            
+            # Compute rule activation based on context
+            if context_embedding is not None:
+                # context: [batch, seq, d_model]
+                context_flat = context_embedding.reshape(-1, self.d_model)
+                rule_activation = torch.softmax(context_flat @ self.rule_keys.T, dim=-1)  # [batch*seq, n_rules]
+                
+                # Apply rule values to logits
+                rule_effect = rule_activation @ self.rule_values  # [batch*seq, vocab]
+                rule_effect = rule_effect.reshape(batch, seq, vocab)
+                
+                # Modulate logits with rule effect (small influence to avoid overriding learning)
+                modulated_logits = prediction_logits + rule_effect * 0.1
+            else:
+                modulated_logits = prediction_logits
+                
+            return modulated_logits
+    
+    def learn_step(self, context_embedding, prediction_error):
+        """Hebbian learning for rule keys and values."""
+        with torch.no_grad():
+            # Learn rules that predict prediction errors
+            if context_embedding is not None:
+                context_flat = context_embedding.reshape(-1, self.d_model)
+                error_flat = prediction_error.reshape(-1, prediction_error.size(-1))
+                
+                # Update rule keys: associate context with error patterns
+                rule_activation = torch.softmax(context_flat @ self.rule_keys.T, dim=-1)
+                
+                # Hebbian update for rule keys
+                dk = (context_flat.T @ rule_activation) / context_flat.size(0)
+                self.rule_keys.data.add_(dk.T, alpha=self._lr * 0.01)
+                self.rule_keys.data.clamp_(-1.0, 1.0)
+
+
 class CogLang:
     def __init__(self):
         self.modules = nn.ModuleList()
@@ -561,6 +618,8 @@ class CogLang:
         m = EpisodicMemory(d_model, memory_size, target_dim); self.modules.append(m); self._memory = m; return m
     def IntrinsicMotivation(self, d_model):
         m = IntrinsicMotivation(d_model); self.modules.append(m); self._motivation = m; return m
+    def NeuroSymbolicBridge(self, vocab_size, d_model, n_rules=16):
+        m = NeuroSymbolicBridge(vocab_size, d_model, n_rules); self.modules.append(m); self._bridge = m; return m
 
     def to(self, device):
         self.modules.to(device)
@@ -594,6 +653,11 @@ class CogLang:
         errors, states, predictions = self._stack(sparse_x, context, memory_retrieved=memory_retrieved, errors_for_attn=sparse_x, learn=learn)
         pred = self._stack.mixed_prediction(predictions)
         output, hidden = self._decoder(pred)
+        
+        # PHASE 8: Apply neuro-symbolic rules to output
+        if self._bridge is not None:
+            output = self._bridge(output, context_embedding=sparse_x)
+            
         return output, {'errors': errors, 'predictions': predictions, 'hidden': hidden, 'pred': pred, 'sparse': sparse_x}
 
     def learn(self, input_ids):
@@ -639,8 +703,8 @@ class CogLang:
         return None
 
 
-def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4):
-    """Anima in CogLang v3 — AGI Architecture mit allen Phasen."""
+def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4, n_rules=16):
+    """Anima in CogLang v3 — Vollständige AGI Architecture mit allen 8 Phasen."""
     brain = CogLang()
     brain.SensoryInput(vocab_size=vocab_size, d_model=d_model)
     brain.SparseEncoder(input_dim=d_model, d_sparse=d_sparse, sparsity=0.02)
@@ -648,6 +712,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.OutputDecoder(d_sparse=d_sparse, d_model=d_model, vocab_size=vocab_size, lr=lr)
     brain.EpisodicMemory(d_model=d_sparse, memory_size=memory_size, target_dim=d_state)
     brain.IntrinsicMotivation(d_model=d_sparse)
+    brain.NeuroSymbolicBridge(vocab_size=vocab_size, d_model=d_sparse, n_rules=n_rules)
     brain.to(device)
-    print(f'CogLang v3: {brain.parameter_count()/1e6:.1f}M Parameter | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn_heads={n_attention_heads}')
+    print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}')
     return brain

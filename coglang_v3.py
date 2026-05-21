@@ -9,7 +9,7 @@ import os
 
 
 class CogModule(nn.Module):
-    """Basis für alle CogLang-Module."""
+    """Basis für alle CogLang-Module — mit Meta-Plastizität (PHASE 2)."""
     def __init__(self, name=None):
         super().__init__()
         self.name = name or self.__class__.__name__
@@ -17,18 +17,41 @@ class CogModule(nn.Module):
         self._lr = 0.05
         self._momentum_factor = 0.9
         self._max_weight = 3.0
-
+        # PHASE 2: Meta-Plastizität — adaptive learning rate
+        self._meta_lr_scale = 1.0  # Dynamically adjusted
+        self._error_history = []
+        self._meta_lr_target_error = 0.5  # Target error for optimal learning
+        
     def learn(self, lr=0.05, momentum=0.9):
         self._lr = lr
         self._momentum_factor = momentum
         return self
 
+    def _update_meta_plasticity(self, current_error_norm):
+        """PHASE 2: Adjust learning rate based on error magnitude."""
+        self._error_history.append(current_error_norm)
+        if len(self._error_history) > 100:
+            self._error_history.pop(0)
+        
+        avg_error = sum(self._error_history) / len(self._error_history)
+        
+        # If error is high -> increase plasticity (learn faster)
+        # If error is low -> decrease plasticity (stabilize)
+        if avg_error > self._meta_lr_target_error * 2:
+            self._meta_lr_scale = min(2.0, self._meta_lr_scale * 1.05)
+        elif avg_error < self._meta_lr_target_error * 0.5:
+            self._meta_lr_scale = max(0.1, self._meta_lr_scale * 0.95)
+            
     def _hebbian(self, error, inp, weight, lr_eff=1.0):
-        """NLMS Hebbian update."""
+        """NLMS Hebbian update mit Meta-Plastizität."""
         e_2d = error.reshape(-1, error.size(-1))
         i_2d = inp.reshape(-1, inp.size(-1))
         inp_pow = (i_2d ** 2).sum(dim=1, keepdim=True) + 1e-8
         dW = (e_2d / inp_pow).T @ i_2d
+        
+        # PHASE 2: Apply meta-plasticity scaling
+        lr_eff *= self._meta_lr_scale
+        
         if weight not in self._momentum:
             self._momentum[weight] = dW.clone()
         else:
@@ -194,6 +217,11 @@ class PredictiveLayer(CogModule):
 
             if learn:
                 lr_eff = self._lr / (batch * seq)
+                
+                # PHASE 2: Update meta-plasticity based on current error
+                error_norm = (error ** 2).sum().item() ** 0.5
+                self._update_meta_plasticity(error_norm)
+                
                 # W_pred: NLMS Hebbian
                 self._hebbian(error, inp, self.W_pred.weight, lr_eff)
                 

@@ -127,15 +127,14 @@ def run_evolution():
             brain.save_checkpoint('/home/anima/best_model.pt', config=config)
             print("Neues Best Model gespeichert!")
         
-        # Generation speichern und Benchmark berechnen
+        # PHASE 12: Online Evaluation — Automatische Quality Metriken
         gen_scores = []
         for prompt in ['ROMEO:', 'KING ']:
             ctx = torch.tensor([[stoi.get(c, 0) for c in prompt]], device=device)
             for _ in range(150):
                 out, info = brain.forward(ctx[:, -128:], learn=False)
-                logits = out[:, -1, :] / 0.8 # Temperature scaling
+                logits = out[:, -1, :] / 0.8
                 
-                # Top-k Sampling
                 k = 40
                 top_k_logits, top_k_indices = torch.topk(logits, k)
                 probs = F.softmax(top_k_logits, dim=-1)
@@ -147,14 +146,16 @@ def run_evolution():
             with open(f'/home/anima/evolve_gen_{config["iteration"]}_{prompt.strip()}.txt', 'w') as f:
                 f.write(gen)
             
-            # Einfacher Qualitäts-Benchmark: Unique Token Ratio & Repetition Penalty
+            # PHASE 12: Quality Metrics
             tokens = gen.split()
             if len(tokens) > 0:
                 unique_ratio = len(set(tokens)) / len(tokens)
-                # Check for excessive repetition (e.g., same 3-gram appearing > 3 times)
                 trigrams = [tuple(tokens[i:i+3]) for i in range(len(tokens)-2)]
                 rep_score = 1.0 - (len(set(trigrams)) / max(1, len(trigrams)))
-                score = unique_ratio * (1.0 - rep_score * 0.5) # Higher is better
+                # PHASE 12: New metrics
+                avg_word_len = sum(len(t) for t in tokens) / len(tokens)
+                punctuation_ratio = sum(1 for t in tokens if any(c in t for c in '.,!?;:')) / len(tokens)
+                score = unique_ratio * (1.0 - rep_score * 0.5) * (avg_word_len / 5.0) * (1.0 + punctuation_ratio)
                 gen_scores.append(score)
         
         avg_gen_score = sum(gen_scores) / len(gen_scores) if gen_scores else 0

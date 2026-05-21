@@ -43,43 +43,41 @@ class EpisodicMemory(CogModule):
     PHASE 1: Working Memory — Content-Addressable Episodic Memory.
     Speichert vergangene Zustände und ruft sie basierend auf Ähnlichkeit ab.
     """
-    def __init__(self, d_model, memory_size=64):
+    def __init__(self, d_model, memory_size=64, target_dim=None):
         super().__init__()
         self.d_model = d_model
         self.memory_size = memory_size
+        self.target_dim = target_dim or d_model
         # Memory slots: each slot stores a state vector
         self.register_buffer('memory', torch.zeros(memory_size, d_model))
-        self.register_buffer('memory_age', torch.zeros(memory_size))  # How old each slot is
-        self.register_buffer('memory_strength', torch.ones(memory_size))  # Retrieval strength
+        self.register_buffer('memory_age', torch.zeros(memory_size))
+        self.register_buffer('memory_strength', torch.ones(memory_size))
         
         # Hebbian write/read weights
         self.W_write = nn.Linear(d_model, memory_size, bias=False)
         self.W_read = nn.Linear(memory_size, d_model, bias=False)
+        # Projection to match layer state dimension
+        self.W_proj = nn.Linear(d_model, self.target_dim, bias=False)
         self._max_weight = 1.0
         
     def forward(self, query, write_state=None):
         """
         query: current state to retrieve similar memories [batch, seq, d_model]
         write_state: optional state to write into memory [batch, d_model]
-        Returns: retrieved memory [batch, seq, d_model]
+        Returns: retrieved memory projected to target_dim [batch, seq, target_dim]
         """
         with torch.no_grad():
             batch, seq, d = query.shape
             
-            # Compute similarity between query and memory slots
-            # query: [batch, seq, d] -> [batch*seq, d]
-            # memory: [memory_size, d]
-            q_flat = query.reshape(-1, d)  # [batch*seq, d]
-            similarity = q_flat @ self.memory.T  # [batch*seq, memory_size]
-            
-            # Attention over memory slots
+            q_flat = query.reshape(-1, d)
+            similarity = q_flat @ self.memory.T
             attention = torch.softmax(similarity / (d ** 0.5), dim=-1)
-            
-            # Read from memory
-            retrieved = attention @ self.memory  # [batch*seq, d]
+            retrieved = attention @ self.memory
             retrieved = retrieved.reshape(batch, seq, d)
             
-            # Write to memory if write_state provided
+            # Project to target dimension
+            retrieved = self.W_proj(retrieved)
+            
             if write_state is not None:
                 self._write_to_memory(write_state)
                 
@@ -322,8 +320,8 @@ class CogLang:
     def OutputDecoder(self, d_sparse, d_model, vocab_size, lr=0.05):
         m = OutputDecoder(d_sparse, d_model, vocab_size); self.modules.append(m); self._decoder = m
         m._lr = lr; return m
-    def EpisodicMemory(self, d_model, memory_size=64):
-        m = EpisodicMemory(d_model, memory_size); self.modules.append(m); self._memory = m; return m
+    def EpisodicMemory(self, d_model, memory_size=64, target_dim=None):
+        m = EpisodicMemory(d_model, memory_size, target_dim); self.modules.append(m); self._memory = m; return m
 
     def to(self, device):
         self.modules.to(device)
@@ -399,7 +397,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.SparseEncoder(input_dim=d_model, d_sparse=d_sparse, sparsity=0.02)
     brain.PredictiveStack(d_model=d_sparse, n_layers=n_layers, d_state=d_state, d_context=d_context, lr=lr)
     brain.OutputDecoder(d_sparse=d_sparse, d_model=d_model, vocab_size=vocab_size, lr=lr)
-    brain.EpisodicMemory(d_model=d_sparse, memory_size=memory_size)
+    brain.EpisodicMemory(d_model=d_sparse, memory_size=memory_size, target_dim=d_state)
     brain.to(device)
     print(f'CogLang v3: {brain.parameter_count()/1e6:.1f}M Parameter | d_model={d_model}, n_layers={n_layers}, memory={memory_size}')
     return brain

@@ -285,11 +285,12 @@ class PredictiveAttention(CogModule):
 
 
 class PredictiveLayer(CogModule):
-    def __init__(self, d_model, d_state=64, d_context=128):
+    def __init__(self, d_model, d_state=64, d_context=128, timescale=1.0):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         self.d_context = d_context
+        self.timescale = timescale  # PHASE 5: 1.0 = fast, <1.0 = slow
         self.W_pred = nn.Linear(d_state + d_context, d_model, bias=False)
         self.W_error = nn.Linear(d_model, d_state, bias=False)
         self.W_gate = nn.Linear(d_state + d_model + d_context, d_state)
@@ -340,7 +341,8 @@ class PredictiveLayer(CogModule):
                 # Gate: Learnable with stabilized LR
                 gate_in = torch.cat([state, error, ctx], dim=-1)
                 gate = torch.sigmoid(self.W_gate(gate_in))
-                new_state = (1 - gate) * state + gate * delta
+                # PHASE 5: Timescale modulation - slower layers update less
+                new_state = (1 - gate * self.timescale) * state + (gate * self.timescale) * delta
                 
                 # Hebbian update for W_gate
                 gate_error = (new_state - state)
@@ -359,7 +361,8 @@ class PredictiveLayer(CogModule):
                 delta = self.W_error(error)
                 gate_in = torch.cat([state, error, ctx], dim=-1)
                 gate = torch.sigmoid(self.W_gate(gate_in))
-                new_state = (1 - gate) * state + gate * delta
+                # PHASE 5: Timescale modulation
+                new_state = (1 - gate * self.timescale) * state + (gate * self.timescale) * delta
 
             self.state = new_state[0:1, -1:, :].detach()
             self.error_trace = error[0:1, -1, :].detach()
@@ -373,7 +376,13 @@ class PredictiveLayer(CogModule):
 class PredictiveStack(CogModule):
     def __init__(self, d_model, n_layers=4, d_state=64, d_context=128, n_attention_heads=4):
         super().__init__()
-        self.layers = nn.ModuleList([PredictiveLayer(d_model, d_state, d_context) for _ in range(n_layers)])
+        # PHASE 5: Multi-Scale Timescales - lower layers fast, higher layers slow
+        self.n_layers = n_layers
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            # Timescale: 1.0 for first layer, decreasing for deeper layers
+            timescale = max(0.1, 1.0 - (i / n_layers) * 0.8)
+            self.layers.append(PredictiveLayer(d_model, d_state, d_context, timescale=timescale))
         self.pred_mixer = nn.Parameter(torch.ones(n_layers) / n_layers)
         # PHASE 3: Predictive Attention
         self.attention = PredictiveAttention(d_model, n_heads=n_attention_heads)

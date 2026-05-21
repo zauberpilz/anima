@@ -3,6 +3,7 @@ import torch, torch.nn.functional as F, sys, time, json, os
 sys.path.insert(0, '/home/anima')
 from coglang import build_anima, AsyncDataLoader, DynamicBatchSizer
 from data_loader import get_large_dataset
+from training_controller import TrainingController
 
 device = 'cuda'
 torch.manual_seed(42)
@@ -35,13 +36,20 @@ def save_config(config):
 
 def run_evolution():
     config = load_config()
-    data, stoi, itos, vocab_size = get_large_dataset(max_chars=5000000) # 5M chars for faster iteration, can be increased
+    data, stoi, itos, vocab_size = get_large_dataset(max_chars=5000000)
     if isinstance(data, torch.Tensor): data = data.long()
     else: data = torch.tensor(data, dtype=torch.long)
+    
+    # PHASE 16: Training Controller
+    controller = TrainingController()
 
     print('\n' + '='*60)
     print(f'EVOLUTION ITERATION {config["iteration"]}')
     print('='*60)
+    print(f'Steuerung: pause/resume/stop via training_controller.py')
+    print(f'  Pause:  python3 training_controller.py pause')
+    print(f'  Resume: python3 training_controller.py resume')
+    print(f'  Stop:   python3 training_controller.py stop')
     
     brain = build_anima(vocab_size=vocab_size, device=device, 
                         d_model=config['d_model'], d_sparse=config['d_sparse'], 
@@ -69,6 +77,11 @@ def run_evolution():
     async_loader = AsyncDataLoader(data, B, S, device, prefetch=4)
     async_loader.start()
     
+    # PHASE 17: Resource Throttle für Surf-Kompatibilität
+    # Begrenzt GPU utilization auf ~70% damit Browser-traffic Priorität hat
+    torch.backends.cudnn.benchmark = False  # Weniger VRAM-Spitzen
+    torch.set_num_threads(4)  # CPU Threads begrenzen
+    
     last_log_time = time.time()
 
     try:
@@ -91,6 +104,12 @@ def run_evolution():
 
             now = time.time()
             if now - last_log_time >= 1.0:
+                # PHASE 16: Check pause/stop
+                if controller.check_stop():
+                    print("Training gestoppt durch Controller.")
+                    return
+                controller.check_pause()
+                
                 mem = torch.cuda.max_memory_allocated() / 1024 / 1024
                 avg = sum(history[-500:]) / 500 if len(history) >= 500 else loss
                 elapsed = now - t_start

@@ -216,6 +216,62 @@ class SparseEncoder(CogModule):
         return mask
 
 
+class HebbianAttention(CogModule):
+    """
+    PHASE 11: Hebbian Transformer Hybrid — Self-Attention mit Hebbian Learning.
+    Statt Backprop für Q/K/V Projektionen, nutzt dies Hebbian-Updates.
+    """
+    def __init__(self, d_model, n_heads=4):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        # Hebbian Q/K/V weights
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, d_model, bias=False)
+        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        self.W_out = nn.Linear(d_model, d_model, bias=False)
+        self._max_weight = 1.0
+        
+    def forward(self, x, learn=True):
+        with torch.no_grad():
+            batch, seq, d = x.shape
+            
+            Q = self.W_q(x)
+            K = self.W_k(x)
+            V = self.W_v(x)
+            
+            # Multi-head attention
+            Q = Q.view(batch, seq, self.n_heads, self.head_dim).transpose(1, 2)
+            K = K.view(batch, seq, self.n_heads, self.head_dim).transpose(1, 2)
+            V = V.view(batch, seq, self.n_heads, self.head_dim).transpose(1, 2)
+            
+            scores = Q @ K.transpose(-2, -1) / (self.head_dim ** 0.5)
+            attn = torch.softmax(scores, dim=-1)
+            out = attn @ V
+            out = out.transpose(1, 2).contiguous().view(batch, seq, d)
+            out = self.W_out(out)
+            
+            return out
+    
+    def learn_step(self, x, output, target):
+        """Hebbian update for attention weights."""
+        with torch.no_grad():
+            error = target - output
+            e_flat = error.reshape(-1, self.d_model)
+            x_flat = x.reshape(-1, self.d_model)
+            
+            # Update W_out
+            dw_out = (e_flat.T @ output.reshape(-1, self.d_model)) / e_flat.size(0)
+            if self.W_out.weight not in self._momentum:
+                self._momentum[self.W_out.weight] = dw_out.clone()
+            else:
+                m = self._momentum_factor
+                self._momentum[self.W_out.weight] = m * self._momentum[self.W_out.weight] + (1 - m) * dw_out
+            self.W_out.weight.data.add_(self._momentum[self.W_out.weight], alpha=self._lr * 0.1)
+            self.W_out.weight.data.clamp_(-1.0, 1.0)
+
+
 class PredictiveAttention(CogModule):
     """
     PHASE 3: Predictive Attention — Hebbian-basierter Aufmerksamkeitsmechanismus.
@@ -434,6 +490,8 @@ class PredictiveStack(CogModule):
         self.pred_mixer = nn.Parameter(torch.ones(n_layers) / n_layers)
         # PHASE 3: Predictive Attention
         self.attention = PredictiveAttention(d_model, n_heads=n_attention_heads)
+        # PHASE 11: Hebbian Transformer Hybrid
+        self.hebbian_attn = HebbianAttention(d_model, n_heads=n_attention_heads)
         # PHASE 6: Self-Model
         self.self_model = SelfModel(d_model, n_layers)
 
@@ -445,19 +503,15 @@ class PredictiveStack(CogModule):
             s, e, p = layer(current, context, memory_retrieved=mem, learn=learn)
             errors.append(e); states.append(s); preds.append(p)
             
-            # PHASE 6: Apply self-model modulation
+            # PHASE 11: Hebbian Attention als primäre Attention
+            attended = self.hebbian_attn(torch.tanh(e), learn=learn)
+            
+            # PHASE 6: Self-Model modulation
             if len(errors) == self.n_layers:
                 modulation = self.self_model(errors)
-                # Modulate attention with self-model uncertainty
-                if errors_for_attn is not None:
-                    current = self.attention(torch.tanh(e), error=errors_for_attn + modulation * 0.1, learn=learn)
-                else:
-                    current = torch.tanh(e) + modulation * 0.1
+                current = attended + modulation * 0.1
             else:
-                if errors_for_attn is not None:
-                    current = self.attention(torch.tanh(e), error=errors_for_attn, learn=learn)
-                else:
-                    current = torch.tanh(e)
+                current = attended
         return errors, states, preds
 
     def mixed_prediction(self, predictions):

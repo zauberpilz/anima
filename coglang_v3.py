@@ -373,19 +373,69 @@ class PredictiveLayer(CogModule):
         self.error_trace = torch.zeros(1, self.d_model, device=device)
 
 
+class SelfModel(CogModule):
+    """
+    PHASE 6: Self-Model — Meta-kognitive Repräsentation der eigenen Struktur.
+    Das Modell trackt seine eigene Unsicherheit und nutzt sie zur Verhaltensmodulation.
+    """
+    def __init__(self, d_model, n_layers):
+        super().__init__()
+        self.d_model = d_model
+        self.n_layers = n_layers
+        # Track per-layer prediction error statistics
+        self.register_buffer('layer_error_mean', torch.zeros(n_layers))
+        self.register_buffer('layer_error_var', torch.zeros(n_layers))
+        # Self-confidence: how well the model predicts overall
+        self.register_buffer('self_confidence', torch.tensor(0.5))
+        # Uncertainty projection: maps error stats to modulation signal
+        self.W_uncertainty = nn.Linear(n_layers, d_model, bias=False)
+        self._max_weight = 1.0
+        
+    def forward(self, layer_errors):
+        """
+        layer_errors: list of error tensors per layer
+        Returns: uncertainty modulation signal [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            # Update error statistics
+            for i, err in enumerate(layer_errors):
+                if i < self.n_layers:
+                    err_norm = (err ** 2).sum(dim=-1).mean().item()
+                    # Exponential moving average
+                    self.layer_error_mean[i] = 0.9 * self.layer_error_mean[i] + 0.1 * err_norm
+                    self.layer_error_var[i] = 0.9 * self.layer_error_var[i] + 0.1 * (err_norm - self.layer_error_mean[i]) ** 2
+            
+            # Compute overall uncertainty
+            total_uncertainty = self.layer_error_mean.mean().item()
+            # Self-confidence: inverse of uncertainty (normalized)
+            self.self_confidence.fill_(1.0 / (1.0 + total_uncertainty))
+            self.self_confidence.clamp_(0.1, 1.0)
+            
+            # Generate uncertainty modulation signal
+            # High uncertainty -> stronger modulation
+            uncertainty_vec = self.layer_error_mean.unsqueeze(0).unsqueeze(0)  # [1, 1, n_layers]
+            modulation = self.W_uncertainty(uncertainty_vec)  # [1, 1, d_model]
+            return modulation
+    
+    def get_confidence(self):
+        """Return current self-confidence score."""
+        return self.self_confidence.item()
+
+
 class PredictiveStack(CogModule):
     def __init__(self, d_model, n_layers=4, d_state=64, d_context=128, n_attention_heads=4):
         super().__init__()
-        # PHASE 5: Multi-Scale Timescales - lower layers fast, higher layers slow
+        # PHASE 5: Multi-Scale Timescales
         self.n_layers = n_layers
         self.layers = nn.ModuleList()
         for i in range(n_layers):
-            # Timescale: 1.0 for first layer, decreasing for deeper layers
             timescale = max(0.1, 1.0 - (i / n_layers) * 0.8)
             self.layers.append(PredictiveLayer(d_model, d_state, d_context, timescale=timescale))
         self.pred_mixer = nn.Parameter(torch.ones(n_layers) / n_layers)
         # PHASE 3: Predictive Attention
         self.attention = PredictiveAttention(d_model, n_heads=n_attention_heads)
+        # PHASE 6: Self-Model
+        self.self_model = SelfModel(d_model, n_layers)
 
     def forward(self, x, context=None, memory_retrieved=None, errors_for_attn=None, learn=True):
         errors, states, preds = [], [], []
@@ -395,11 +445,19 @@ class PredictiveStack(CogModule):
             s, e, p = layer(current, context, memory_retrieved=mem, learn=learn)
             errors.append(e); states.append(s); preds.append(p)
             
-            # PHASE 3: Apply attention after each layer
-            if errors_for_attn is not None:
-                current = self.attention(torch.tanh(e), error=errors_for_attn, learn=learn)
+            # PHASE 6: Apply self-model modulation
+            if len(errors) == self.n_layers:
+                modulation = self.self_model(errors)
+                # Modulate attention with self-model uncertainty
+                if errors_for_attn is not None:
+                    current = self.attention(torch.tanh(e), error=errors_for_attn + modulation * 0.1, learn=learn)
+                else:
+                    current = torch.tanh(e) + modulation * 0.1
             else:
-                current = torch.tanh(e)
+                if errors_for_attn is not None:
+                    current = self.attention(torch.tanh(e), error=errors_for_attn, learn=learn)
+                else:
+                    current = torch.tanh(e)
         return errors, states, preds
 
     def mixed_prediction(self, predictions):

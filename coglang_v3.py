@@ -9,7 +9,7 @@ import os
 
 
 class CogModule(nn.Module):
-    """Basis für alle CogLang-Module — mit Meta-Plastizität (PHASE 2)."""
+    """Basis für alle CogLang-Module — mit Meta-Plastizität (PHASE 2) + EWC (PHASE 4)."""
     def __init__(self, name=None):
         super().__init__()
         self.name = name or self.__class__.__name__
@@ -17,10 +17,14 @@ class CogModule(nn.Module):
         self._lr = 0.05
         self._momentum_factor = 0.9
         self._max_weight = 3.0
-        # PHASE 2: Meta-Plastizität — adaptive learning rate
-        self._meta_lr_scale = 1.0  # Dynamically adjusted
+        # PHASE 2: Meta-Plastizität
+        self._meta_lr_scale = 1.0
         self._error_history = []
-        self._meta_lr_target_error = 0.5  # Target error for optimal learning
+        self._meta_lr_target_error = 0.5
+        # PHASE 4: EWC — Elastic Weight Consolidation
+        self._ewc_fisher = {}  # Fisher Information Matrix diagonal approximation
+        self._ewc_optimal_params = {}  # Snapshot of important weights
+        self._ewc_lambda = 0.1  # EWC penalty strength
         
     def learn(self, lr=0.05, momentum=0.9):
         self._lr = lr
@@ -32,24 +36,41 @@ class CogModule(nn.Module):
         self._error_history.append(current_error_norm)
         if len(self._error_history) > 100:
             self._error_history.pop(0)
-        
         avg_error = sum(self._error_history) / len(self._error_history)
-        
-        # If error is high -> increase plasticity (learn faster)
-        # If error is low -> decrease plasticity (stabilize)
         if avg_error > self._meta_lr_target_error * 2:
             self._meta_lr_scale = min(2.0, self._meta_lr_scale * 1.05)
         elif avg_error < self._meta_lr_target_error * 0.5:
             self._meta_lr_scale = max(0.1, self._meta_lr_scale * 0.95)
             
+    def _ewc_consolidate(self, weight):
+        """PHASE 4: Apply EWC penalty to prevent catastrophic forgetting."""
+        if weight in self._ewc_fisher and weight in self._ewc_optimal_params:
+            fisher = self._ewc_fisher[weight]
+            optimal = self._ewc_optimal_params[weight]
+            # Penalty: -lambda * fisher * (current - optimal)
+            penalty = -self._ewc_lambda * fisher * (weight.data - optimal)
+            weight.data.add_(penalty, alpha=0.01)  # Small step to avoid instability
+            
+    def _ewc_update_fisher(self, weight, gradient_estimate):
+        """PHASE 4: Update Fisher Information diagonal approximation."""
+        if weight not in self._ewc_fisher:
+            self._ewc_fisher[weight] = gradient_estimate ** 2
+        else:
+            # Exponential moving average of Fisher
+            self._ewc_fisher[weight] = 0.9 * self._ewc_fisher[weight] + 0.1 * (gradient_estimate ** 2)
+            
+    def _ewc_snapshot(self):
+        """PHASE 4: Save current weights as optimal for EWC."""
+        for name, param in self.named_parameters():
+            if param.requires_grad or True:  # Track all weights
+                self._ewc_optimal_params[name] = param.data.clone()
+            
     def _hebbian(self, error, inp, weight, lr_eff=1.0):
-        """NLMS Hebbian update mit Meta-Plastizität."""
+        """NLMS Hebbian update mit Meta-Plastizität + EWC."""
         e_2d = error.reshape(-1, error.size(-1))
         i_2d = inp.reshape(-1, inp.size(-1))
         inp_pow = (i_2d ** 2).sum(dim=1, keepdim=True) + 1e-8
         dW = (e_2d / inp_pow).T @ i_2d
-        
-        # PHASE 2: Apply meta-plasticity scaling
         lr_eff *= self._meta_lr_scale
         
         if weight not in self._momentum:
@@ -57,8 +78,15 @@ class CogModule(nn.Module):
         else:
             m = self._momentum_factor
             self._momentum[weight] = m * self._momentum[weight] + (1 - m) * dW
+            
+        # PHASE 4: Apply EWC penalty before update
+        self._ewc_consolidate(weight)
+        
         weight.data.add_(lr_eff * self._momentum[weight])
         weight.data.clamp_(-self._max_weight, self._max_weight)
+        
+        # PHASE 4: Update Fisher with current gradient magnitude
+        self._ewc_update_fisher(weight, self._momentum[weight])
 
 
 class EpisodicMemory(CogModule):

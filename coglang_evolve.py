@@ -67,11 +67,16 @@ def run_evolution():
     
     # Checkpoint Loading
     checkpoint_path = '/home/anima/checkpoint.pt'
-    loaded_config = brain.load_checkpoint(checkpoint_path)
-    if loaded_config:
-        print("Checkpoint gefunden und geladen!")
-        # Optional: Config aus Checkpoint übernehmen falls nötig
-        config['best_loss'] = loaded_config.get('best_loss', config['best_loss'])
+    try:
+        loaded_config = brain.load_checkpoint(checkpoint_path)
+        if loaded_config:
+            print("Checkpoint gefunden und geladen!")
+            config['best_loss'] = loaded_config.get('best_loss', config['best_loss'])
+    except RuntimeError as e:
+        if "size mismatch" in str(e) or "Missing key" in str(e):
+            print(f"[EVOLUTION] Architektur geändert ({e}). Starte mit frischen Gewichten.")
+        else:
+            raise e
 
     print(f'VRAM nach Init: {torch.cuda.memory_allocated()/1024/1024:.0f}MB')
     print(f'Modell-Größe: {brain.parameter_count()/1e6:.1f}M Parameter')

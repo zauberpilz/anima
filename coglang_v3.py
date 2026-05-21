@@ -705,6 +705,64 @@ class EvolutionStrategyOptimizer(CogModule):
                 param.data.clamp_(-self._max_weight, self._max_weight)
 
 
+class SkillModule(CogModule):
+    """
+    PHASE 14: Modularer Skill-Mechanismus — Spezialisierte Sub-Netzwerke.
+    Das Modell kann spezialisierte 'Skills' aktivieren basierend auf dem Input-Kontext.
+    """
+    def __init__(self, d_model, n_skills=8):
+        super().__init__()
+        self.d_model = d_model
+        self.n_skills = n_skills
+        # Skill prototypes: each skill is a direction in embedding space
+        self.skill_prototypes = nn.Parameter(torch.randn(n_skills, d_model) * 0.1)
+        # Skill-specific transformation matrices
+        self.skill_transforms = nn.Parameter(torch.randn(n_skills, d_model, d_model) * 0.01)
+        # Skill activation history for meta-learning
+        self.register_buffer('skill_usage', torch.zeros(n_skills))
+        self._max_weight = 1.0
+        
+    def forward(self, x, context=None):
+        """
+        Activate skills based on context and apply transformations.
+        x: [batch, seq, d_model]
+        Returns: transformed output [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            batch, seq, d = x.shape
+            
+            # Compute skill activation from context
+            if context is not None:
+                ctx_mean = context.mean(dim=1, keepdim=True)  # [batch, 1, d]
+                skill_scores = torch.softmax(ctx_mean @ self.skill_prototypes.T, dim=-1)  # [batch, 1, n_skills]
+            else:
+                skill_scores = torch.ones(batch, 1, self.n_skills, device=x.device) / self.n_skills
+            
+            # Update skill usage statistics
+            self.skill_usage = 0.9 * self.skill_usage + 0.1 * skill_scores.mean(dim=0).squeeze()
+            
+            # Apply weighted skill transformations
+            output = x.clone()
+            for i in range(self.n_skills):
+                weight = skill_scores[:, :, i:i+1]  # [batch, 1, 1]
+                transform = self.skill_transforms[i]  # [d, d]
+                output = output + weight * (x @ transform)
+            
+            return output
+    
+    def learn_step(self, context, output_error):
+        """Hebbian learning for skill prototypes and transforms."""
+        with torch.no_grad():
+            if context is not None:
+                ctx_mean = context.mean(dim=1)  # [batch, d]
+                
+                # Update skill prototypes based on error correlation
+                for i in range(self.n_skills):
+                    error_corr = (ctx_mean * output_error.mean(dim=1)).sum(dim=1).mean()
+                    self.skill_prototypes.data[i].add_(ctx_mean.mean(dim=0) * error_corr * self._lr * 0.01)
+                    self.skill_prototypes.data[i].clamp_(-1.0, 1.0)
+
+
 class CogLang:
     def __init__(self):
         self.modules = nn.ModuleList()
@@ -734,6 +792,8 @@ class CogLang:
         m = NeuroSymbolicBridge(vocab_size, d_model, n_rules); self.modules.append(m); self._bridge = m; return m
     def EvolutionStrategy(self, d_model, population_size=8, sigma=0.01):
         m = EvolutionStrategyOptimizer(d_model, population_size, sigma); self.modules.append(m); self._es = m; return m
+    def SkillModule(self, d_model, n_skills=8):
+        m = SkillModule(d_model, n_skills); self.modules.append(m); self._skills = m; return m
 
     def to(self, device):
         self.modules.to(device)
@@ -817,8 +877,8 @@ class CogLang:
         return None
 
 
-def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4, n_rules=16, es_population=8):
-    """Anima in CogLang v3 — Vollständige AGI Architecture mit allen 13 Phasen."""
+def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4, n_rules=16, es_population=8, n_skills=8):
+    """Anima in CogLang v3 — Vollständige AGI Architecture mit allen 14 Phasen."""
     brain = CogLang()
     brain.SensoryInput(vocab_size=vocab_size, d_model=d_model)
     brain.SparseEncoder(input_dim=d_model, d_sparse=d_sparse, sparsity=0.02)
@@ -828,6 +888,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.IntrinsicMotivation(d_model=d_sparse)
     brain.NeuroSymbolicBridge(vocab_size=vocab_size, d_model=d_sparse, n_rules=n_rules)
     brain.EvolutionStrategy(d_model=d_sparse, population_size=es_population, sigma=0.01)
+    brain.SkillModule(d_model=d_sparse, n_skills=n_skills)
     brain.to(device)
-    print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES_pop={es_population}')
+    print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')
     return brain

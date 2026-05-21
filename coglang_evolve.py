@@ -63,6 +63,7 @@ def run_evolution():
     t_start = time.time()
     
     # PHASE 15: Efficiency Features
+    steps_per_iter = config['generation_step']
     batch_sizer = DynamicBatchSizer(initial_batch=8, initial_seq=128, max_vram_mb=config['max_vram_mb'])
     B, S = batch_sizer.get_sizes()
     async_loader = AsyncDataLoader(data, B, S, device, prefetch=4)

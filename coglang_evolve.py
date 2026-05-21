@@ -1,15 +1,21 @@
 """Cobra Evolution — Autonome Optimierungsschleife mit Efficiency Features."""
 import torch, torch.nn.functional as F, sys, time, json, os
-sys.path.insert(0, '/home/anima')
+sys.path.insert(0, '/home/anima/src')
 from coglang import build_anima, AsyncDataLoader, DynamicBatchSizer
-from data_loader import get_large_dataset
+from data_loader import get_large_dataset, get_mixed_dataset
 from training_controller import TrainingController
+
+# Clean directory paths
+CHECKPOINT_DIR = '/home/anima/checkpoints'
+CONFIG_FILE = '/home/anima/evolution_config.json'
+GENERATION_DIR = '/home/anima/generations'
+CONTROL_DIR = '/home/anima/control'
 
 device = 'cuda'
 torch.manual_seed(42)
 
 # Konfiguration für die Evolution
-config_file = '/home/anima/evolution_config.json'
+config_file = CONFIG_FILE
 
 def load_config():
     if os.path.exists(config_file):
@@ -66,7 +72,7 @@ def run_evolution():
                         d_context=config['d_context'], lr=config['lr'])
     
     # Checkpoint Loading
-    checkpoint_path = '/home/anima/checkpoint.pt'
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, 'checkpoint.pt')
     try:
         loaded_config = brain.load_checkpoint(checkpoint_path)
         if loaded_config:
@@ -185,9 +191,9 @@ def run_evolution():
         save_config(config)
         
         # Checkpoints speichern
-        brain.save_checkpoint('/home/anima/checkpoint.pt', config=config)
+        brain.save_checkpoint(os.path.join(CHECKPOINT_DIR, 'checkpoint.pt'), config=config)
         if final_loss < config['best_loss']:
-            brain.save_checkpoint('/home/anima/best_model.pt', config=config)
+            brain.save_checkpoint(os.path.join(CHECKPOINT_DIR, 'best_model.pt'), config=config)
             print("Neues Best Model gespeichert!")
         
         # PHASE 12: Online Evaluation — Automatische Quality Metriken
@@ -206,7 +212,7 @@ def run_evolution():
                 
                 ctx = torch.cat([ctx, next_token], dim=-1)
             gen = ''.join(itos.get(int(i), '?') for i in ctx[0])
-            with open(f'/home/anima/evolve_gen_{config["iteration"]}_{prompt.strip()}.txt', 'w') as f:
+            with open(os.path.join(GENERATION_DIR, f'evolve_gen_{config["iteration"]}_{prompt.strip()}.txt'), 'w') as f:
                 f.write(gen)
             
             # PHASE 12: Quality Metrics

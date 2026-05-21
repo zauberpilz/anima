@@ -24,10 +24,11 @@ def load_config():
             "d_state": 128,
             "d_context": 256,
             "lr": 0.05,
-            "max_vram_mb": 4500, # Limit für Streaming-Kompatibilität (3.5GB frei)
+            "max_vram_mb": 4500,
             "generation_step": 50000,
             "best_loss": float('inf'),
-            "iteration": 0
+            "iteration": 0,
+            "use_code_data": False  # PHASE 20: Code-Daten aktivieren
         }
 
 def save_config(config):
@@ -36,7 +37,15 @@ def save_config(config):
 
 def run_evolution():
     config = load_config()
-    data, stoi, itos, vocab_size = get_large_dataset(max_chars=5000000)
+    
+    # PHASE 20: Multi-Source Data Pipeline
+    use_code_data = config.get('use_code_data', False)
+    if use_code_data:
+        print("[DATA] Lade Mixed Dataset (Code + Text)...")
+        data, stoi, itos, vocab_size = get_mixed_dataset(max_chars=5000000, code_ratio=0.3)
+    else:
+        data, stoi, itos, vocab_size = get_large_dataset(max_chars=5000000)
+        
     if isinstance(data, torch.Tensor): data = data.long()
     else: data = torch.tensor(data, dtype=torch.long)
     

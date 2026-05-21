@@ -153,12 +153,18 @@ class CogModule(nn.Module):
                 self._ewc_optimal_params[name] = param.data.clone()
             
     def _hebbian(self, error, inp, weight, lr_eff=1.0):
-        """NLMS Hebbian update mit Meta-Plastizität + EWC."""
+        """NLMS Hebbian update mit Meta-Plastizität + EWC + Sparse Updates."""
         e_2d = error.reshape(-1, error.size(-1))
         i_2d = inp.reshape(-1, inp.size(-1))
         inp_pow = (i_2d ** 2).sum(dim=1, keepdim=True) + 1e-8
         dW = (e_2d / inp_pow).T @ i_2d
         lr_eff *= self._meta_lr_scale
+        
+        # PHASE 21: Sparse Weight Updates - nur signifikante Updates
+        # Threshold basierend auf Gradient-Norm
+        grad_norm = dW.abs().mean()
+        sparse_mask = dW.abs() > (grad_norm * 0.1)  # Nur Top 10% der Updates
+        dW = dW * sparse_mask.float()
         
         if weight not in self._momentum:
             self._momentum[weight] = dW.clone()

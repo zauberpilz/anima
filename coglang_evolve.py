@@ -2,7 +2,7 @@
 import torch, torch.nn.functional as F, sys, time, json, os
 sys.path.insert(0, '/home/anima')
 from coglang import build_anima
-from anima.data import get_shakespeare_data
+from data_loader import get_large_dataset
 
 device = 'cuda'
 torch.manual_seed(42)
@@ -35,7 +35,7 @@ def save_config(config):
 
 def run_evolution():
     config = load_config()
-    data, stoi, itos, vocab_size = get_shakespeare_data(max_chars=200000)
+    data, stoi, itos, vocab_size = get_large_dataset(max_chars=5000000) # 5M chars for faster iteration, can be increased
     if isinstance(data, torch.Tensor): data = data.long()
     else: data = torch.tensor(data, dtype=torch.long)
 
@@ -48,12 +48,20 @@ def run_evolution():
                         n_layers=config['n_layers'], d_state=config['d_state'], 
                         d_context=config['d_context'], lr=config['lr'])
     
+    # Checkpoint Loading
+    checkpoint_path = '/home/anima/checkpoint.pt'
+    loaded_config = brain.load_checkpoint(checkpoint_path)
+    if loaded_config:
+        print("Checkpoint gefunden und geladen!")
+        # Optional: Config aus Checkpoint übernehmen falls nötig
+        config['best_loss'] = loaded_config.get('best_loss', config['best_loss'])
+
     print(f'VRAM nach Init: {torch.cuda.memory_allocated()/1024/1024:.0f}MB')
     print(f'Modell-Größe: {brain.parameter_count()/1e6:.1f}M Parameter')
 
     history = []
     t_start = time.time()
-    B, S = 16, 128
+    B, S = 16, 256 # Optimized: Longer sequences for better context, stable VRAM
     steps_per_iter = config['generation_step']
     last_log_time = time.time()
 
@@ -75,9 +83,10 @@ def run_evolution():
                 elapsed_m, elapsed_s = divmod(int(elapsed), 60)
                 remaining_steps = steps_per_iter - step
                 eta_secs = remaining_steps / speed if speed > 0 else 0
-                eta_m, eta_s = divmod(int(eta_secs), 60)
+                eta_h, eta_rem = divmod(int(eta_secs), 3600)
+                eta_m, eta_s = divmod(eta_rem, 60)
                 
-                status = f'[{pct:5.1f}%] Step {step:5d} | loss={avg:.4f} | VRAM={mem:.0f}MB | {speed:.1f}step/s | +{elapsed_m:02d}:{elapsed_s:02d} | ETA {eta_m:02d}:{eta_s:02d}'
+                status = f'[{pct:5.1f}%] Step {step:5d} | loss={avg:.4f} | VRAM={mem:.0f}MB | {speed:.1f}step/s | +{elapsed_m:02d}:{elapsed_s:02d} | ETA {eta_h:02d}:{eta_m:02d}:{eta_s:02d}'
                 print(f'\r{status}', end='', flush=True)
                 last_log_time = now
 
@@ -111,6 +120,12 @@ def run_evolution():
             config['lr'] *= 0.8 # Decay
 
         save_config(config)
+        
+        # Checkpoints speichern
+        brain.save_checkpoint('/home/anima/checkpoint.pt', config=config)
+        if final_loss < config['best_loss']:
+            brain.save_checkpoint('/home/anima/best_model.pt', config=config)
+            print("Neues Best Model gespeichert!")
         
         # Generation speichern und Benchmark berechnen
         gen_scores = []

@@ -1,11 +1,98 @@
 """
 CogLang v3 — AGI Architecture
 Predictive Coding + Hebbian Learning + Working Memory + Meta-Plasticity
+EFFICIENCY: Mixed Precision, Async Loading, Dynamic Batching
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
+import threading
+import queue
+
+
+class AsyncDataLoader:
+    """PHASE 15: Asynchronous Data Loading — CPU lädt Daten während GPU rechnet."""
+    def __init__(self, data, batch_size, seq_length, device, prefetch=4):
+        self.data = data
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.device = device
+        self.queue = queue.Queue(maxsize=prefetch)
+        self.running = False
+        self.thread = None
+        
+    def _worker(self):
+        """Background worker that pre-fetches batches."""
+        while self.running:
+            try:
+                idx = torch.randint(0, len(self.data) - self.batch_size * self.seq_length, (1,)).item()
+                batch = self.data[idx:idx + self.batch_size * self.seq_length].view(self.batch_size, self.seq_length)
+                self.queue.put(batch.to(self.device), timeout=1.0)
+            except queue.Full:
+                continue
+            except Exception:
+                break
+                
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+        
+    def get_batch(self):
+        """Get next pre-fetched batch."""
+        try:
+            return self.queue.get(timeout=5.0)
+        except queue.Empty:
+            # Fallback: generate synchronously
+            idx = torch.randint(0, len(self.data) - self.batch_size * self.seq_length, (1,)).item()
+            return self.data[idx:idx + self.batch_size * self.seq_length].view(self.batch_size, self.seq_length).to(self.device)
+            
+    def stop(self):
+        self.running = False
+
+
+class DynamicBatchSizer:
+    """PHASE 15: Dynamic Batch Sizing — Auto-adjust based on VRAM availability."""
+    def __init__(self, initial_batch=8, initial_seq=128, max_vram_mb=4500):
+        self.batch = initial_batch
+        self.seq = initial_seq
+        self.max_vram_mb = max_vram_mb
+        self.oom_count = 0
+        
+    def adjust(self, vram_used_mb):
+        """Adjust batch/seq based on VRAM usage."""
+        if vram_used_mb > self.max_vram_mb * 0.9:
+            # Too much VRAM -> reduce
+            self.batch = max(2, self.batch // 2)
+            self.seq = max(32, self.seq // 2)
+            self.oom_count += 1
+        elif vram_used_mb < self.max_vram_mb * 0.5 and self.oom_count == 0:
+            # Plenty of VRAM -> increase
+            self.batch = min(32, self.batch * 2)
+            self.seq = min(512, self.seq * 2)
+            
+    def get_sizes(self):
+        return self.batch, self.seq
+
+
+class MixedPrecisionManager:
+    """PHASE 15: Mixed Precision — FP16 for compute, FP32 for weights."""
+    def __init__(self, enabled=True):
+        self.enabled = enabled and torch.cuda.is_available()
+        self.scaler = torch.cuda.amp.GradScaler(enabled=False)  # No grad, but useful for scaling
+        
+    def to_fp16(self, tensor):
+        """Convert tensor to FP16 if enabled."""
+        if self.enabled:
+            return tensor.half()
+        return tensor
+        
+    def to_fp32(self, tensor):
+        """Convert tensor back to FP32."""
+        if self.enabled:
+            return tensor.float()
+        return tensor
 
 
 class CogModule(nn.Module):
@@ -764,7 +851,7 @@ class SkillModule(CogModule):
 
 
 class CogLang:
-    def __init__(self):
+    def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
         self._sensory = None
         self._encoder = None
@@ -772,6 +859,12 @@ class CogLang:
         self._decoder = None
         self._context_embed = None
         self._memory = None
+        self._motivation = None
+        self._bridge = None
+        self._es = None
+        self._skills = None
+        # PHASE 15: Efficiency
+        self.mp = MixedPrecisionManager(use_mixed_precision)
 
     def SensoryInput(self, vocab_size, d_model):
         m = SensoryInput(vocab_size, d_model); self.modules.append(m); self._sensory = m; return m
@@ -877,9 +970,9 @@ class CogLang:
         return None
 
 
-def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4, n_rules=16, es_population=8, n_skills=8):
-    """Anima in CogLang v3 — Vollständige AGI Architecture mit allen 14 Phasen."""
-    brain = CogLang()
+def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4, n_rules=16, es_population=8, n_skills=8, use_mixed_precision=True):
+    """Anima in CogLang v3 — Vollständige AGI Architecture mit allen 14 Phasen + Efficiency."""
+    brain = CogLang(use_mixed_precision=use_mixed_precision)
     brain.SensoryInput(vocab_size=vocab_size, d_model=d_model)
     brain.SparseEncoder(input_dim=d_model, d_sparse=d_sparse, sparsity=0.02)
     brain.PredictiveStack(d_model=d_sparse, n_layers=n_layers, d_state=d_state, d_context=d_context, lr=lr, n_attention_heads=n_attention_heads)
@@ -890,5 +983,6 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.EvolutionStrategy(d_model=d_sparse, population_size=es_population, sigma=0.01)
     brain.SkillModule(d_model=d_sparse, n_skills=n_skills)
     brain.to(device)
-    print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')
+    precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
+    print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')
     return brain

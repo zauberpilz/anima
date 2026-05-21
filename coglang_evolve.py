@@ -1,7 +1,7 @@
-"""Cobra Evolution — Autonome Optimierungsschleife."""
+"""Cobra Evolution — Autonome Optimierungsschleife mit Efficiency Features."""
 import torch, torch.nn.functional as F, sys, time, json, os
 sys.path.insert(0, '/home/anima')
-from coglang import build_anima
+from coglang import build_anima, AsyncDataLoader, DynamicBatchSizer
 from data_loader import get_large_dataset
 
 device = 'cuda'
@@ -61,16 +61,32 @@ def run_evolution():
 
     history = []
     t_start = time.time()
-    B, S = 8, 128 # Reduced for streaming compatibility
-    steps_per_iter = config['generation_step']
+    
+    # PHASE 15: Efficiency Features
+    batch_sizer = DynamicBatchSizer(initial_batch=8, initial_seq=128, max_vram_mb=config['max_vram_mb'])
+    B, S = batch_sizer.get_sizes()
+    async_loader = AsyncDataLoader(data, B, S, device, prefetch=4)
+    async_loader.start()
+    
     last_log_time = time.time()
 
     try:
         for step in range(steps_per_iter):
-            idx = torch.randint(0, len(data) - B * S, (1,)).item()
-            batch = data[idx:idx + B * S].view(B, S).to(device)
+            # PHASE 15: Get batch from async loader
+            batch = async_loader.get_batch()
             loss, _ = brain.learn(batch)
             history.append(loss)
+            
+            # PHASE 15: Dynamic batch sizing every 1000 steps
+            if step % 1000 == 0:
+                vram_used = torch.cuda.max_memory_allocated() / 1024 / 1024
+                batch_sizer.adjust(vram_used)
+                new_B, new_S = batch_sizer.get_sizes()
+                if new_B != B or new_S != S:
+                    B, S = new_B, new_S
+                    async_loader.batch_size = B
+                    async_loader.seq_length = S
+                    print(f'\n[EFFICIENCY] Batch angepasst: B={B}, S={S}')
 
             now = time.time()
             if now - last_log_time >= 1.0:

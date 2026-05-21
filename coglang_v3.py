@@ -496,6 +496,46 @@ class OutputDecoder(CogModule):
         return d_hidden
 
 
+class IntrinsicMotivation(CogModule):
+    """
+    PHASE 7: Intrinsische Motivation — Neugier-getriebenes Lernen.
+    Prediction Error wird als interner Reward-Signal genutzt.
+    Hoher Error (Novelty) -> erhöhtes Lernen. Niedriger Error -> Stabilisierung.
+    """
+    def __init__(self, d_model):
+        super().__init__()
+        self.d_model = d_model
+        self.register_buffer('curiosity_drive', torch.tensor(0.5))  # Internal curiosity level
+        self.register_buffer('novelty_threshold', torch.tensor(1.0))
+        self.register_buffer('reward_history', torch.zeros(100))
+        self._reward_idx = 0
+        
+    def compute_intrinsic_reward(self, error):
+        """
+        Compute intrinsic reward from prediction error.
+        Returns: reward scalar and curiosity modulation factor.
+        """
+        with torch.no_grad():
+            # Error magnitude as novelty signal
+            error_norm = (error ** 2).sum(dim=-1).mean().item()
+            
+            # Intrinsic reward: higher when error exceeds threshold (novelty detection)
+            intrinsic_reward = max(0, error_norm - self.novelty_threshold.item())
+            
+            # Update curiosity drive with exponential moving average
+            self.curiosity_drive = 0.95 * self.curiosity_drive + 0.05 * intrinsic_reward
+            
+            # Update reward history
+            self.reward_history[self._reward_idx] = intrinsic_reward
+            self._reward_idx = (self._reward_idx + 1) % 100
+            
+            # Curiosity modulation: scale learning based on recent rewards
+            avg_reward = self.reward_history.mean().item()
+            curiosity_factor = 1.0 + avg_reward * 0.5  # Boost learning when curious
+            
+            return intrinsic_reward, curiosity_factor
+
+
 class CogLang:
     def __init__(self):
         self.modules = nn.ModuleList()
@@ -519,6 +559,8 @@ class CogLang:
         m._lr = lr; return m
     def EpisodicMemory(self, d_model, memory_size=64, target_dim=None):
         m = EpisodicMemory(d_model, memory_size, target_dim); self.modules.append(m); self._memory = m; return m
+    def IntrinsicMotivation(self, d_model):
+        m = IntrinsicMotivation(d_model); self.modules.append(m); self._motivation = m; return m
 
     def to(self, device):
         self.modules.to(device)
@@ -564,6 +606,16 @@ class CogLang:
             if self._memory is not None:
                 self._memory._write_to_memory(info['sparse'][:, -1, :])
             
+            # PHASE 7: Intrinsic Motivation - compute curiosity reward
+            if self._motivation is not None:
+                total_error = sum((e ** 2).sum().item() for e in info['errors'])
+                reward, curiosity_factor = self._motivation.compute_intrinsic_reward(info['errors'][0])
+                # Modulate meta-plasticity with curiosity
+                for module in self.modules.modules():
+                    if hasattr(module, '_meta_lr_scale'):
+                        module._meta_lr_scale *= curiosity_factor
+                        module._meta_lr_scale = max(0.1, min(2.0, module._meta_lr_scale))
+            
             loss = F.cross_entropy(output.view(-1, output.size(-1)), input_ids.view(-1))
         return loss.item(), info
 
@@ -588,13 +640,14 @@ class CogLang:
 
 
 def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4):
-    """Anima in CogLang v3 — mit Working Memory + Predictive Attention."""
+    """Anima in CogLang v3 — AGI Architecture mit allen Phasen."""
     brain = CogLang()
     brain.SensoryInput(vocab_size=vocab_size, d_model=d_model)
     brain.SparseEncoder(input_dim=d_model, d_sparse=d_sparse, sparsity=0.02)
     brain.PredictiveStack(d_model=d_sparse, n_layers=n_layers, d_state=d_state, d_context=d_context, lr=lr, n_attention_heads=n_attention_heads)
     brain.OutputDecoder(d_sparse=d_sparse, d_model=d_model, vocab_size=vocab_size, lr=lr)
     brain.EpisodicMemory(d_model=d_sparse, memory_size=memory_size, target_dim=d_state)
+    brain.IntrinsicMotivation(d_model=d_sparse)
     brain.to(device)
     print(f'CogLang v3: {brain.parameter_count()/1e6:.1f}M Parameter | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn_heads={n_attention_heads}')
     return brain

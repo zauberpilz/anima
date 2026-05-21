@@ -99,7 +99,7 @@ def run_evolution():
         pass
         
     # PHASE 23: Hard VRAM Limit (3GB)
-    torch.cuda.set_per_process_memory_fraction(0.45, device=device)  # Max 45% of 8GB ~ 3.6GB
+    torch.cuda.set_per_process_memory_fraction(0.45, device=0)  # Max 45% of 8GB ~ 3.6GB
     
     last_log_time = time.time()
 

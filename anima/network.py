@@ -1,5 +1,6 @@
 """
-Anima Network — skalierte Version: 3M Parameter, Hebbian + Momentum.
+Anima Network — skalierte Version (50M Parameter).
+Kein Backprop. NLMS + Momentum + Embedding-Training.
 """
 import torch
 import torch.nn as nn
@@ -15,9 +16,9 @@ from .safety import SafetyCore
 
 
 class Anima(nn.Module):
-    def __init__(self, vocab_size=256, d_model=256, d_sparse=1024,
-                 d_state=64, d_context=128, n_layers=4, sparsity=0.02,
-                 mem_capacity=8192, max_seq_len=8192):
+    def __init__(self, vocab_size=256, d_model=512, d_sparse=4096,
+                 d_state=256, d_context=512, n_layers=8, sparsity=0.02,
+                 mem_capacity=20000, max_seq_len=8192):
         super().__init__()
         self.d_model = d_model
         self.max_seq_len = max_seq_len
@@ -93,6 +94,17 @@ class Anima(nn.Module):
 
                 self.out_head.weight.data.clamp_(-2.0, 2.0)
                 self.out_proj.weight.data.clamp_(-2.0, 2.0)
+
+                # Embedding-Training: projiziere Output-Fehler zurück ins Embedding
+                # error_out: [B, S, V] → d_hidden: [B, S, d_model]
+                # Aktualisiere Embedding jedes Tokens basierend auf gemitteltem Fehlersignal
+                d_hidden = error_out @ self.out_head.weight
+                unique_tokens = torch.unique(input_ids)
+                for v in unique_tokens:
+                    mask = (input_ids == v)
+                    if mask.sum() > 0:
+                        avg = d_hidden[mask].mean(dim=0)
+                        self.embed.weight.data[v] += self.online_lr * 0.01 * avg
 
         self.generation_count += 1
 

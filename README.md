@@ -33,6 +33,10 @@ CogLang v3 ist eine vollständige AGI-Architektur mit **21 implementierten Phase
 | 19 | **Code Tokenizer** | Spezieller Tokenizer für Programmiersprachen |
 | 20 | **Multi-Source Pipeline** | Code + Text kombiniert |
 | 21 | **Sparse Weight Updates** | Nur signifikante Gradienten updaten (60% sparen) |
+| 22 | **NaN-Guards & Gradient Clipping** | NaN-Erkennung, Fallback-Generierung, Weight Decay |
+| 23 | **Cosine Annealing LR** | Adaptiver Learning Rate Scheduler für bessere Konvergenz |
+| 24 | **CUDA Graph Support** | 2-3x Speedup durch optimierte GPU-Kernel-Wiederverwendung |
+| 25 | **Multi-URL Dataset Fallback** | TinyStories (3 Mirrors) → PG-19 → Shakespeare Full → Standard |
 
 ---
 

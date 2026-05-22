@@ -1,5 +1,5 @@
 """Cobra Evolution — Autonome Optimierungsschleife mit Efficiency Features."""
-import torch, torch.nn.functional as F, sys, time, json, os
+import torch, torch.nn.functional as F, sys, time, json, os, math, gc
 sys.path.insert(0, '/home/anima/src')
 from coglang import build_anima, AsyncDataLoader, DynamicBatchSizer
 from data_loader import get_large_dataset, get_mixed_dataset
@@ -40,6 +40,12 @@ def load_config():
 def save_config(config):
     with open(config_file, 'w') as f:
         json.dump(config, f, indent=4)
+
+
+def cosine_anneal_lr(base_lr, step, total_steps, cycle_steps=50000):
+    """Cosine Annealing Learning Rate Schedule."""
+    progress = (step % max(1, cycle_steps)) / max(1, cycle_steps)
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 def run_evolution():
     config = load_config()
@@ -118,6 +124,13 @@ def run_evolution():
         for step in range(steps_per_iter):
             # PHASE 15: Get batch from async loader
             batch = async_loader.get_batch()
+            # PHASE 24: Cosine Annealing LR Scheduler
+            current_lr = config['lr']
+            if step > 1000:
+                current_lr = cosine_anneal_lr(config['lr'], step, steps_per_iter * 2)
+            for layer_idx, layer in enumerate(brain._stack.layers):
+                layer._lr = current_lr * (0.95 ** layer_idx)
+            
             loss, _ = brain.learn(batch)
             history.append(loss)
             
@@ -155,13 +168,16 @@ def run_evolution():
                 eta_h, eta_rem = divmod(int(eta_secs), 3600)
                 eta_m, eta_s = divmod(eta_rem, 60)
                 
-                status = f'[{pct:5.1f}%] Step {step:5d} | loss={avg:.4f} | VRAM={mem:.0f}MB | {speed:.1f}step/s | +{elapsed_m:02d}:{elapsed_s:02d} | ETA {eta_h:02d}:{eta_m:02d}:{eta_s:02d}'
+                status = f'[{pct:5.1f}%] Step {step:5d} | loss={avg:.4f} | LR={current_lr:.6f} | VRAM={mem:.0f}MB | {speed:.1f}step/s | +{elapsed_m:02d}:{elapsed_s:02d} | ETA {eta_h:02d}:{eta_m:02d}:{eta_s:02d}'
                 print(f'\r{status}', end='', flush=True)
                 last_log_time = now
 
-                if loss != loss:
-                    print('\n!!! NaN DETEKTIERT !!!')
-                    return # Abbruch der Iteration, zur Mutation/Reset
+                if loss != loss or torch.isnan(torch.tensor(loss)):
+                    print('\n!!! NaN DETEKTIERT - Recovery !!!')
+                    config['lr'] *= 0.5
+                    save_config(config)
+                    print(f'  LR auf {config["lr"]:.6f} reduziert')
+                    return
 
             # Sicherheitscheck gegen OOM
             if torch.cuda.max_memory_allocated() / 1024 / 1024 > config['max_vram_mb']:
@@ -176,18 +192,23 @@ def run_evolution():
 
         # --- MUTATION / EVOLUTION LOGIK ---
         config['iteration'] += 1
-        if final_loss < config['best_loss']:
+        if final_loss < config['best_loss'] * 0.99:
             print(f'Neuer Rekord! {final_loss:.4f} < {config["best_loss"]:.4f}')
             config['best_loss'] = final_loss
-            # Bei Erfolg: Kapazität leicht erhöhen (Scaling)
-            config['d_model'] = int(config['d_model'] * 1.2)
-            config['n_layers'] += 1
-            print(f'Evolution: Modell wird vergrößert -> d_model={config["d_model"]}, layers={config["n_layers"]}')
+            if config['d_model'] < 1024:
+                config['d_model'] = min(1024, int(config['d_model'] * 1.15))
+            config['n_layers'] = min(18, config['n_layers'] + 1)
+            config['lr'] *= 0.95
+            print(f'Evolution: d_model={config["d_model"]}, layers={config["n_layers"]}, lr={config["lr"]:.6f}')
+        elif final_loss < config['best_loss'] * 1.05:
+            print(f'Leichter Fortschritt {final_loss:.4f}. Optimiere LR.')
+            config['best_loss'] = min(config['best_loss'], final_loss)
+            config['lr'] *= 0.9
         else:
-            # Wenn kein neuer Rekord, versuchen die Lernrate zu optimieren oder Layer-Struktur leicht zu variieren
-            print('Kein Fortschritt. Mutation: Ändere Learning Rate.')
-            config['lr'] *= 0.8 # Decay
-
+            print(f'Kein Fortschritt ({final_loss:.4f} vs {config["best_loss"]:.4f}). Mutation.')
+            config['lr'] *= 0.5
+            if config['d_sparse'] > 2048:
+                config['d_sparse'] = int(config['d_sparse'] * 0.85)
         save_config(config)
         
         # Checkpoints speichern
@@ -199,19 +220,14 @@ def run_evolution():
         # PHASE 12: Online Evaluation — Automatische Quality Metriken
         gen_scores = []
         for prompt in ['ROMEO:', 'KING ']:
-            ctx = torch.tensor([[stoi.get(c, 0) for c in prompt]], device=device)
-            for _ in range(150):
-                out, info = brain.forward(ctx[:, -128:], learn=False)
-                logits = out[:, -1, :] / 0.8
-                
-                k = 40
-                top_k_logits, top_k_indices = torch.topk(logits, k)
-                probs = F.softmax(top_k_logits, dim=-1)
-                next_token = torch.multinomial(probs, 1)
-                next_token = top_k_indices.gather(1, next_token)
-                
-                ctx = torch.cat([ctx, next_token], dim=-1)
-            gen = ''.join(itos.get(int(i), '?') for i in ctx[0])
+            try:
+                ctx = torch.tensor([[stoi.get(c, 0) for c in prompt]], device=device)
+                generated = brain.generate_safe(ctx, max_new=150, temperature=0.7, top_k=30)
+                gen = ''.join(itos.get(int(i), '?') for i in generated[0])
+            except Exception as e:
+                print(f'  [WARN] Generation fehlgeschlagen für "{prompt}": {e}')
+                gen = f'[GENERATION FAILED]'
+            
             with open(os.path.join(GENERATION_DIR, f'evolve_gen_{config["iteration"]}_{prompt.strip()}.txt'), 'w') as f:
                 f.write(gen)
             
@@ -235,7 +251,9 @@ def run_evolution():
     finally:
         # Speicher leeren für nächste Iteration
         del brain
+        gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         print('Cleanup abgeschlossen.')
 
 if __name__ == '__main__':

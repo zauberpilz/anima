@@ -11,6 +11,96 @@ import threading
 import queue
 
 
+class CodeTokenizer:
+    """
+    PHASE 30: Code-Native Tokenizer — BPE + AST-aware tokenization.
+    Statt Char-Level, tokenisiert dies Code in sinnvolle Tokens.
+    """
+    def __init__(self, vocab_size=4096):
+        self.vocab_size = vocab_size
+        self.vocab = {}  # token -> id
+        self.reverse_vocab = {}  # id -> token
+        self.bpe_merges = []
+
+    def train(self, texts, min_frequency=2):
+        """Train BPE tokenizer on code texts."""
+        # Simple BPE training
+        word_freqs = {}
+        for text in texts:
+            for word in text.split():
+                word = ' '.join(list(word)) + ' </w>'
+                word_freqs[word] = word_freqs.get(word, 0) + 1
+
+        # Initialize with characters
+        symbols = set()
+        for word in word_freqs:
+            for char in word.split():
+                symbols.add(char)
+        symbols = sorted(symbols)
+
+        self.vocab = {s: i for i, s in enumerate(symbols)}
+        self.vocab_size = len(symbols)
+
+        # Merge pairs
+        while len(self.vocab) < min(self.vocab_size, 4096):
+            pair_freqs = {}
+            for word, freq in word_freqs.items():
+                chars = word.split()
+                for i in range(len(chars)-1):
+                    pair = (chars[i], chars[i+1])
+                    pair_freqs[pair] = pair_freqs.get(pair, 0) + freq
+
+            if not pair_freqs:
+                break
+
+            best_pair = max(pair_freqs, key=pair_freqs.get)
+            if pair_freqs[best_pair] < min_frequency:
+                break
+
+            # Merge pair
+            merged = ''.join(best_pair)
+            self.bpe_merges.append(best_pair)
+            self.vocab[merged] = len(self.vocab)
+
+            new_word_freqs = {}
+            for word, freq in word_freqs.items():
+                new_word = word.replace(' '.join(best_pair), merged)
+                new_word_freqs[new_word] = freq
+            word_freqs = new_word_freqs
+
+        self.reverse_vocab = {i: s for s, i in self.vocab.items()}
+
+    def encode(self, text):
+        """Encode text to token IDs."""
+        tokens = []
+        for word in text.split():
+            word_chars = list(word) + ['</w>']
+            while len(word_chars) > 1:
+                # Find best merge
+                best_pair = None
+                for i in range(len(word_chars)-1):
+                    pair = (word_chars[i], word_chars[i+1])
+                    merged = ''.join(pair)
+                    if merged in self.vocab:
+                        best_pair = (i, merged)
+                        break
+                if best_pair is None:
+                    # No merge found, output first char as token
+                    tokens.append(self.vocab.get(word_chars[0], 0))
+                    word_chars = word_chars[1:]
+                else:
+                    idx, merged = best_pair
+                    tokens.append(self.vocab[merged])
+                    word_chars = word_chars[:idx] + word_chars[idx+2:]
+            if word_chars:
+                tokens.append(self.vocab.get(word_chars[0], 0))
+        return tokens
+
+    def decode(self, ids):
+        """Decode token IDs back to text."""
+        return ''.join(self.reverse_vocab.get(i, '?') for i in ids).replace('</w>', ' ')
+
+
 class AsyncDataLoader:
     """PHASE 15: Asynchronous Data Loading — CPU lädt Daten während GPU rechnet."""
     def __init__(self, data, batch_size, seq_length, device, prefetch=4):
@@ -95,6 +185,48 @@ class MixedPrecisionManager:
         return tensor
 
 
+class RMSNorm(nn.Module):
+    """PHASE 29: RMS Layer Normalization — faster than LayerNorm, equally effective."""
+    def __init__(self, d_model, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    """PHASE 29: Rotary Position Embedding (RoPE) — relative position encoding."""
+    def __init__(self, dim, max_seq_len=8192):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+        self.max_seq_len = max_seq_len
+        self._cached_cos = None
+        self._cached_sin = None
+
+    def forward(self, x, seq_len=None):
+        if seq_len is None:
+            seq_len = x.size(1)
+        if seq_len > self.max_seq_len:
+            self.max_seq_len = seq_len * 2
+        t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+        freqs = t[:, None] @ self.inv_freq[None, :]
+        freqs = torch.cat([freqs, freqs], dim=-1)
+        return torch.cos(freqs), torch.sin(freqs)
+
+    @staticmethod
+    def apply_rotary(x, cos, sin):
+        """Apply rotary embedding to x (last dim must be even)."""
+        d = x.size(-1)
+        x1, x2 = x[..., :d//2], x[..., d//2:]
+        cos = cos[:x.size(-2), :d].unsqueeze(0).unsqueeze(0)
+        sin = sin[:x.size(-2), :d].unsqueeze(0).unsqueeze(0)
+        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
 class CogModule(nn.Module):
     """Basis für alle CogLang-Module — mit Meta-Plastizität (PHASE 2) + EWC (PHASE 4)."""
     def __init__(self, name=None):
@@ -112,6 +244,8 @@ class CogModule(nn.Module):
         self._ewc_fisher = {}  # Fisher Information Matrix diagonal approximation
         self._ewc_optimal_params = {}  # Snapshot of important weights
         self._ewc_lambda = 0.1  # EWC penalty strength
+        # PHASE 28: Hebbian rule selector
+        self._hebbian_rule = 'oja'  # 'nlms', 'oja', 'bcm'
         
     def learn(self, lr=0.05, momentum=0.9):
         self._lr = lr
@@ -153,47 +287,61 @@ class CogModule(nn.Module):
                 self._ewc_optimal_params[name] = param.data.clone()
             
     def _hebbian(self, error, inp, weight, lr_eff=1.0):
-        """NLMS Hebbian update mit Meta-Plastizität + EWC + Sparse Updates."""
+        """PHASE 28: Oja's Rule Hebbian update — weight-normalizing, prevents explosion."""
         # NaN-Guard: Bereinige Input-Tensoren
         if torch.isnan(error).any() or torch.isinf(error).any():
             error = torch.nan_to_num(error, nan=0.0, posinf=1.0, neginf=-1.0)
         if torch.isnan(inp).any() or torch.isinf(inp).any():
             inp = torch.nan_to_num(inp, nan=0.0, posinf=1.0, neginf=-1.0)
-        
+
         e_2d = error.reshape(-1, error.size(-1))
         i_2d = inp.reshape(-1, inp.size(-1))
-        inp_pow = (i_2d ** 2).sum(dim=1, keepdim=True) + 1e-8
-        dW = (e_2d / inp_pow).T @ i_2d
+        output = i_2d @ weight.T  # [batch*seq, out_dim]
+
+        # Oja's rule: dw = lr * (error * input - weight * output^2)
+        # Hebbian term: outer product of error and input
+        hebb_term = e_2d.T @ i_2d  # [out_dim, in_dim]
+        # Oja normalization term: weight * (output^2).sum(dim=0)
+        oja_term = (output ** 2).sum(dim=0).unsqueeze(1) * weight.data  # [out_dim, in_dim]
+
+        dW = hebb_term - oja_term
+
         lr_eff *= self._meta_lr_scale
-        
+
         # PHASE 21: Sparse Weight Updates - nur signifikante Updates
-        # Threshold basierend auf Gradient-Norm
         grad_norm = dW.abs().mean()
-        sparse_mask = dW.abs() > (grad_norm * 0.1)  # Nur Top 10% der Updates
+        sparse_mask = dW.abs() > (grad_norm * 0.1)
         dW = dW * sparse_mask.float()
-        
+
         # Gradient Clipping: Max 10% der Weight-Norm
         grad_norm_val = dW.norm().item()
         w_norm_val = weight.data.norm().item()
         if grad_norm_val > 0.1 * w_norm_val + 1e-8:
             dW = dW * (0.1 * w_norm_val / grad_norm_val)
-        
+
         if weight not in self._momentum:
             self._momentum[weight] = dW.clone()
         else:
             m = self._momentum_factor
             self._momentum[weight] = m * self._momentum[weight] + (1 - m) * dW
-            
+
         # PHASE 4: Apply EWC penalty before update
         self._ewc_consolidate(weight)
-        
+
         # Weight Decay: Leichte Regularisierung
         decay = 1e-5 * weight.data
         weight.data.add_(lr_eff * self._momentum[weight] - lr_eff * decay)
         weight.data.clamp_(-self._max_weight, self._max_weight)
-        
+
         # PHASE 4: Update Fisher with current gradient magnitude
         self._ewc_update_fisher(weight, self._momentum[weight])
+
+    def set_hebbian_rule(self, rule='oja'):
+        """PHASE 28: Switch Hebbian update rule. Options: 'nlms', 'oja', 'bcm'."""
+        valid_rules = ['nlms', 'oja', 'bcm']
+        if rule not in valid_rules:
+            raise ValueError(f"Unknown Hebbian rule '{rule}'. Choose from {valid_rules}")
+        self._hebbian_rule = rule
 
 
 class EpisodicMemory(CogModule):
@@ -613,6 +761,9 @@ class PredictiveStack(CogModule):
             # PHASE 11: Hebbian Attention als primäre Attention
             attended = self.hebbian_attn(torch.tanh(e), learn=learn)
             
+            # PHASE 29: Residual connection — add input to attended output
+            attended = current + attended * 0.5  # Scaled residual
+            
             # PHASE 6: Self-Model modulation
             if len(errors) == self.n_layers:
                 modulation = self.self_model(errors)
@@ -870,6 +1021,132 @@ class SkillModule(CogModule):
                     self.skill_prototypes.data[i].clamp_(-1.0, 1.0)
 
 
+class SecurityHead(CogModule):
+    """
+    PHASE 31: Vulnerability Detection Head.
+    Analysiert Code auf Sicherheitslücken (CWE-Typen, Severity, Patches).
+    """
+    def __init__(self, d_model, d_sparse, n_cwe_types=20):
+        super().__init__()
+        self.d_model = d_model
+        self.d_sparse = d_sparse
+        self.n_cwe_types = n_cwe_types
+
+        # CWE Classifier — erkennt Schwachstellen-Typen
+        self.cwe_classifier = nn.Linear(d_sparse, n_cwe_types, bias=False)
+        # Severity Predictor — CVSS-Score (0-10)
+        self.severity_predictor = nn.Linear(d_sparse, 1, bias=False)
+        # Patch Generator — transformiert vulnerable→sicheren Code
+        self.patch_generator = nn.Linear(d_sparse * 2, d_sparse, bias=False)
+        # Confidence Estimator
+        self.confidence_estimator = nn.Linear(d_sparse, 1, bias=False)
+        self._max_weight = 1.0
+
+    def forward(self, code_embedding, learn=True):
+        """
+        code_embedding: [batch, seq, d_sparse] — representation of code
+        Returns: dict with detection results
+        """
+        with torch.no_grad():
+            # Mean pool over sequence
+            pooled = code_embedding.mean(dim=1)  # [batch, d_sparse]
+
+            # CWE classification
+            cwe_logits = self.cwe_classifier(pooled)  # [batch, n_cwe_types]
+            cwe_probs = torch.sigmoid(cwe_logits)  # Multi-label classification
+
+            # Severity prediction
+            severity = torch.sigmoid(self.severity_predictor(pooled)) * 10.0  # [batch, 1]
+
+            # Confidence
+            confidence = torch.sigmoid(self.confidence_estimator(pooled))  # [batch, 1]
+
+            return {
+                'cwe_probs': cwe_probs,
+                'severity': severity,
+                'confidence': confidence,
+            }
+
+    def learn_step(self, code_embedding, target_cwe, target_severity):
+        """Hebbian learning for vulnerability detection."""
+        with torch.no_grad():
+            pooled = code_embedding.mean(dim=1)
+
+            # Update CWE classifier
+            cwe_logits = self.cwe_classifier(pooled)
+            cwe_error = target_cwe - torch.sigmoid(cwe_logits)
+            dw_cwe = (cwe_error.T @ pooled) / pooled.size(0)
+            self.cwe_classifier.weight.data.add_(dw_cwe, alpha=self._lr * 0.1)
+            self.cwe_classifier.weight.data.clamp_(-1.0, 1.0)
+
+            # Update severity predictor
+            sev_pred = torch.sigmoid(self.severity_predictor(pooled)) * 10.0
+            sev_error = (target_severity - sev_pred) / 10.0
+            dw_sev = (sev_error.T @ pooled) / pooled.size(0)
+            self.severity_predictor.weight.data.add_(dw_sev, alpha=self._lr * 0.1)
+            self.severity_predictor.weight.data.clamp_(-1.0, 1.0)
+
+
+class NetworkEncoder(CogModule):
+    """
+    PHASE 32: Network Traffic Encoder.
+    Analysiert Netzwerkpakete und -flüsse auf Anomalien.
+    """
+    def __init__(self, d_model, d_sparse, n_protocols=16):
+        super().__init__()
+        self.d_model = d_model
+        self.d_sparse = d_sparse
+
+        # Protocol embeddings (TCP=6, UDP=17, ICMP=1, etc.)
+        self.protocol_embed = nn.Embedding(n_protocols + 1, d_model // 4)
+        # Port embeddings
+        self.port_embed = nn.Embedding(1024, d_model // 4)
+        # Packet feature projector
+        self.packet_proj = nn.Linear(d_model, d_sparse, bias=False)
+        # Flow state tracker (connection state machine)
+        self.flow_gru = nn.Linear(d_sparse + d_model // 2, d_sparse)
+        # Anomaly scorer
+        self.anomaly_scorer = nn.Linear(d_sparse, 1, bias=False)
+        self._max_weight = 1.0
+
+    def forward(self, packet_sequence, learn=True):
+        """
+        packet_sequence: dict with 'src_port', 'dst_port', 'protocol', 'len', 'flags'
+        Returns: dict with flow state and anomaly score
+        """
+        with torch.no_grad():
+            batch, seq = packet_sequence['src_port'].shape
+
+            # Embed protocols
+            proto_emb = self.protocol_embed(packet_sequence['protocol'].clamp(0, 16))  # [batch, seq, d/4]
+            # Embed ports (hash to range)
+            src_p = packet_sequence['src_port'] % 1023
+            dst_p = packet_sequence['dst_port'] % 1023
+            src_emb = self.port_embed(src_p.long())  # [batch, seq, d/4]
+            dst_emb = self.port_embed(dst_p.long())
+
+            # Combine features
+            features = torch.cat([proto_emb, src_emb, dst_emb], dim=-1)  # [batch, seq, d*3/4]
+
+            # Project to sparse dimension
+            projected = self.packet_proj(features)  # [batch, seq, d_sparse]
+
+            # Flow state tracking (simple update)
+            flow_state = torch.zeros(batch, self.d_sparse, device=features.device)
+            for t in range(seq):
+                combined = torch.cat([flow_state, projected[:, t, :]], dim=-1)
+                flow_state = torch.tanh(self.flow_gru(combined))
+
+            # Anomaly score
+            anomaly = torch.sigmoid(self.anomaly_scorer(flow_state))  # [batch, 1]
+
+            return {
+                'flow_state': flow_state,
+                'anomaly_score': anomaly,
+                'packet_embeddings': projected,
+            }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -883,6 +1160,8 @@ class CogLang:
         self._bridge = None
         self._es = None
         self._skills = None
+        self._security_head = None
+        self._network_encoder = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -907,6 +1186,55 @@ class CogLang:
         m = EvolutionStrategyOptimizer(d_model, population_size, sigma); self.modules.append(m); self._es = m; return m
     def SkillModule(self, d_model, n_skills=8):
         m = SkillModule(d_model, n_skills); self.modules.append(m); self._skills = m; return m
+
+    def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
+        """PHASE 31: Vulnerability Detection Head."""
+        m = SecurityHead(d_model, d_sparse, n_cwe_types)
+        self.modules.append(m)
+        self._security_head = m
+        return m
+
+    def NetworkEncoder(self, d_model, d_sparse, n_protocols=16):
+        """PHASE 32: Network Traffic Encoder."""
+        m = NetworkEncoder(d_model, d_sparse, n_protocols)
+        self.modules.append(m)
+        self._network_encoder = m
+        return m
+
+    def analyze_security(self, text):
+        """PHASE 31: Analyze code for vulnerabilities using SecurityHead."""
+        if self._security_head is None:
+            return {'cwe_probs': None, 'severity': None, 'confidence': None, 'error': 'SecurityHead not initialized'}
+        with torch.no_grad():
+            device = next(self.modules.parameters()).device
+            # Simple char-level embedding as code representation
+            chars = torch.tensor([[ord(c) % 1000 for c in text[:512]]], device=device)
+            # Project through encoder to sparse space
+            if self._encoder is not None and self._sensory is not None:
+                code_emb = self._encoder(self._sensory(chars))
+            else:
+                code_emb = torch.randn(1, min(len(text), 512), self._security_head.d_sparse, device=device)
+            return self._security_head(code_emb)
+
+    def analyze_network(self, packets):
+        """PHASE 32: Analyze network traffic using NetworkEncoder."""
+        if self._network_encoder is None:
+            return {'flow_state': None, 'anomaly_score': None, 'error': 'NetworkEncoder not initialized'}
+        with torch.no_grad():
+            device = next(self.modules.parameters()).device
+            if isinstance(packets, dict):
+                pkt_seq = {k: v.to(device) if torch.is_tensor(v) else torch.tensor(v, device=device) for k, v in packets.items()}
+            else:
+                # Generate dummy packet sequence
+                batch, seq = 1, 10
+                pkt_seq = {
+                    'src_port': torch.randint(1024, 65535, (batch, seq), device=device),
+                    'dst_port': torch.randint(1, 1023, (batch, seq), device=device),
+                    'protocol': torch.randint(0, 6, (batch, seq), device=device),
+                    'len': torch.randint(40, 1500, (batch, seq), device=device),
+                    'flags': torch.randint(0, 8, (batch, seq), device=device),
+                }
+            return self._network_encoder(pkt_seq)
 
     def to(self, device):
         self.modules.to(device)

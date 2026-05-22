@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Anima — Live Training Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    background: #0a0a0f;
+    color: #c0c0d0;
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+    padding: 20px;
+    min-height: 100vh;
+}
+.header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 24px; padding-bottom: 16px;
+    border-bottom: 1px solid #1a1a2e;
+}
+.header h1 {
+    font-size: 24px; font-weight: 300;
+    background: linear-gradient(135deg, #00d4ff, #7b2ff7);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.header .status-badge {
+    padding: 6px 16px; border-radius: 20px;
+    font-size: 13px; font-weight: 500;
+    background: #1a3a1a; color: #4cdf4c;
+    border: 1px solid #2a5a2a;
+}
+.header .status-badge.paused { background: #3a3a1a; color: #dfdf4c; border-color: #5a5a2a; }
+.header .status-badge.stopped { background: #3a1a1a; color: #df4c4c; border-color: #5a2a2a; }
+.header .gen-link { font-size: 12px; color: #6a6a8a; }
+
+.grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px; margin-bottom: 24px;
+}
+.metric {
+    background: #12121a; border: 1px solid #1e1e30;
+    border-radius: 12px; padding: 16px;
+    text-align: center; transition: all 0.3s;
+}
+.metric:hover { border-color: #3a3a5a; transform: translateY(-1px); }
+.metric .label { font-size: 11px; color: #6a6a8a; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+.metric .value { font-size: 26px; font-weight: 600; color: #e0e0f0; }
+.metric .value.loss { color: #ff6b6b; }
+.metric .value.good { color: #4cdf4c; }
+.metric .value.warn { color: #dfdf4c; }
+.metric .sub { font-size: 11px; color: #5a5a7a; margin-top: 4px; }
+
+.chart-container {
+    background: #12121a; border: 1px solid #1e1e30;
+    border-radius: 12px; padding: 20px; margin-bottom: 24px;
+}
+.chart-container h3 { font-size: 14px; color: #6a6a8a; margin-bottom: 12px; font-weight: 400; }
+
+.bottom-grid {
+    display: grid; grid-template-columns: 2fr 1fr;
+    gap: 16px; margin-bottom: 24px;
+}
+@media (max-width: 768px) { .bottom-grid { grid-template-columns: 1fr; } }
+
+.generations {
+    background: #12121a; border: 1px solid #1e1e30;
+    border-radius: 12px; padding: 20px;
+}
+.generations h3 { font-size: 14px; color: #6a6a8a; margin-bottom: 12px; font-weight: 400; }
+.gen-entry {
+    background: #0e0e16; border: 1px solid #1a1a28;
+    border-radius: 8px; padding: 12px; margin-bottom: 8px;
+}
+.gen-entry .name { font-size: 11px; color: #5a5a8a; margin-bottom: 6px; }
+.gen-entry .text { font-size: 13px; color: #b0b0c0; line-height: 1.5; word-break: break-all; font-family: 'SF Mono', monospace; }
+.gen-entry .time { font-size: 10px; color: #4a4a6a; margin-top: 4px; }
+
+.controls {
+    background: #12121a; border: 1px solid #1e1e30;
+    border-radius: 12px; padding: 20px;
+}
+.controls h3 { font-size: 14px; color: #6a6a8a; margin-bottom: 12px; font-weight: 400; }
+.btn {
+    padding: 10px 20px; border: 1px solid #2a2a40; border-radius: 8px;
+    background: #1a1a28; color: #c0c0d0; cursor: pointer;
+    font-family: inherit; font-size: 13px; transition: all 0.2s;
+    margin-right: 8px; margin-bottom: 8px;
+}
+.btn:hover { background: #2a2a40; border-color: #4a4a6a; }
+.btn-pause { border-color: #5a5a2a; color: #dfdf4c; }
+.btn-pause:hover { background: #2a2a1a; }
+.btn-stop { border-color: #5a2a2a; color: #df4c4c; }
+.btn-stop:hover { background: #2a1a1a; }
+.btn-resume { border-color: #2a5a2a; color: #4cdf4c; }
+.btn-resume:hover { background: #1a2a1a; }
+
+.info-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 8px; margin-top: 12px;
+}
+.info-item { font-size: 12px; color: #6a6a8a; }
+.info-item span { color: #b0b0c0; }
+
+.footer {
+    text-align: center; font-size: 11px; color: #3a3a5a;
+    padding: 20px 0; border-top: 1px solid #1a1a2e;
+}
+
+.log-container {
+    background: #12121a; border: 1px solid #1e1e30;
+    border-radius: 12px; padding: 20px; margin-bottom: 24px; max-height: 200px; overflow-y: auto;
+}
+.log-container h3 { font-size: 14px; color: #6a6a8a; margin-bottom: 12px; font-weight: 400; }
+.log-line { font-size: 11px; color: #6a6a8a; padding: 1px 0; }
+.log-line:nth-child(odd) { background: #0e0e16; }
+</style>
+</head>
+<body>
+
+<div class="header">
+    <div>
+        <h1>🧠 ANIMA — CogLang v3</h1>
+        <div style="font-size:12px;color:#5a5a7a;margin-top:4px;">
+            <span id="modelInfo">Verbinde...</span>
+        </div>
+    </div>
+    <div>
+        <span class="status-badge" id="statusBadge">● Initializing</span>
+    </div>
+</div>
+
+<div class="grid" id="metricsGrid">
+    <div class="metric"><div class="label">Loss</div><div class="value loss" id="lossValue">—</div><div class="sub" id="bestLoss">best: —</div></div>
+    <div class="metric"><div class="label">Step</div><div class="value" id="stepValue">—</div><div class="sub" id="progressPct">0%</div></div>
+    <div class="metric"><div class="label">Speed</div><div class="value good" id="speedValue">—</div><div class="sub">steps/s</div></div>
+    <div class="metric"><div class="label">VRAM</div><div class="value" id="vramValue">—</div><div class="sub" id="vramPct"></div></div>
+    <div class="metric"><div class="label">Learning Rate</div><div class="value" id="lrValue">—</div><div class="sub">cosine anneal</div></div>
+    <div class="metric"><div class="label">ETA</div><div class="value" id="etaValue">—</div><div class="sub" id="elapsedValue">+0:00</div></div>
+</div>
+
+<div class="chart-container">
+    <h3>📉 Loss Curve (letzte 500 Steps)</h3>
+    <canvas id="lossChart" height="250"></canvas>
+</div>
+
+<div class="bottom-grid">
+    <div class="generations">
+        <h3>📝 Generation Samples</h3>
+        <div id="generationsList"><div style="color:#4a4a6a;font-size:13px;">Warte auf erste Generierung...</div></div>
+    </div>
+    <div>
+        <div class="controls">
+            <h3>🎮 Training Control</h3>
+            <button class="btn btn-pause" onclick="sendControl('pause')">⏸️ Pause</button>
+            <button class="btn btn-resume" onclick="sendControl('resume')">▶️ Resume</button>
+            <button class="btn btn-stop" onclick="sendControl('stop')">🛑 Stop</button>
+            <div class="info-grid" id="configInfo">
+                <div class="info-item">Iteration: <span id="cfgIteration">—</span></div>
+                <div class="info-item">d_model: <span id="cfgDModel">—</span></div>
+                <div class="info-item">Layers: <span id="cfgLayers">—</span></div>
+                <div class="info-item">Params: <span id="cfgParams">—</span></div>
+                <div class="info-item">Batch: <span id="cfgBatch">—</span></div>
+                <div class="info-item">VRAM Limit: <span id="cfgVramLimit">—</span></div>
+            </div>
+        </div>
+        <div class="controls" style="margin-top:16px;">
+            <h3>💾 Checkpoint</h3>
+            <div class="info-grid">
+                <div class="info-item">Größe: <span id="ckptSize">—</span></div>
+                <div class="info-item">Alter: <span id="ckptAge">—</span></div>
+                <div class="info-item">GPU: <span id="gpuTemp">—</span></div>
+                <div class="info-item">GPU Util: <span id="gpuUtil">—</span></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="footer">
+    Anima AGI • Live Monitoring • Aktualisiert alle 2s
+    <span id="lastUpdate" style="margin-left:16px;color:#3a3a4a;"></span>
+</div>
+
+<script>
+// === CHART SETUP ===
+const ctx = document.getElementById('lossChart').getContext('2d');
+const lossChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+        labels: [],
+        datasets: [{
+            label: 'Loss',
+            data: [],
+            borderColor: '#ff6b6b',
+            backgroundColor: 'rgba(255,107,107,0.05)',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 0,
+            borderWidth: 2,
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 200 },
+        plugins: {
+            legend: { display: false },
+            tooltip: {
+                backgroundColor: '#1a1a2e',
+                titleColor: '#c0c0d0',
+                bodyColor: '#ff6b6b',
+                borderColor: '#2a2a40',
+                borderWidth: 1,
+                cornerRadius: 8,
+            }
+        },
+        scales: {
+            x: {
+                display: true,
+                grid: { color: '#1a1a28', drawBorder: false },
+                ticks: { color: '#5a5a7a', font: { size: 10 }, maxTicksLimit: 10 },
+                title: { display: true, text: 'Step', color: '#5a5a7a' }
+            },
+            y: {
+                display: true,
+                grid: { color: '#1a1a28', drawBorder: false },
+                ticks: { color: '#5a5a7a', font: { size: 10 } },
+                title: { display: true, text: 'Loss', color: '#5a5a7a' }
+            }
+        }
+    }
+});
+
+// === POLLING ===
+async function fetchStatus() {
+    try {
+        const resp = await fetch('/api/status');
+        return await resp.json();
+    } catch (e) {
+        console.log('Poll error:', e);
+        return null;
+    }
+}
+
+async function sendControl(action) {
+    try {
+        const resp = await fetch('/api/control', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action })
+        });
+        const data = await resp.json();
+        document.getElementById('statusBadge').textContent = '● ' + data.status;
+        document.getElementById('statusBadge').className = 'status-badge ' + data.status;
+    } catch (e) {
+        console.log('Control error:', e);
+    }
+}
+
+function updateUI(data) {
+    if (!data) return;
+    const t = data.training;
+    const g = data.gpu;
+    const c = data.config;
+    const ck = data.checkpoint;
+    const gens = data.generations || [];
+
+    // Status
+    const badge = document.getElementById('statusBadge');
+    if (t.stopped) { badge.textContent = '● Stopped'; badge.className = 'status-badge stopped'; }
+    else if (t.paused) { badge.textContent = '● Paused'; badge.className = 'status-badge paused'; }
+    else if (t.running) { badge.textContent = '● Training ' + t.progress_pct + '%'; badge.className = 'status-badge'; }
+    else { badge.textContent = '● Idle'; badge.className = 'status-badge stopped'; }
+
+    // Model info
+    document.getElementById('modelInfo').textContent =
+        `Iteration ${t.iteration} · ${t.params_m}M Parameter · d_model=${t.d_model} · ${t.n_layers} Layers`;
+
+    // Metrics
+    document.getElementById('lossValue').textContent = t.loss !== null ? t.loss.toFixed(4) : '—';
+    document.getElementById('bestLoss').textContent = t.best_loss ? `best: ${t.best_loss.toFixed(4)}` : 'best: —';
+    document.getElementById('stepValue').textContent = t.step.toLocaleString();
+    document.getElementById('progressPct').textContent = `${t.progress_pct}%`;
+    document.getElementById('speedValue').textContent = t.speed > 0 ? t.speed.toFixed(1) : '—';
+    document.getElementById('vramValue').textContent = t.vram_mb ? `${t.vram_mb} MB` : `${g.vram_used_mb} MB`;
+    document.getElementById('vramPct').textContent = g.vram_total_mb > 0 ? `${(g.vram_used_mb / g.vram_total_mb * 100).toFixed(0)}% von ${g.vram_total_mb}MB` : '';
+    document.getElementById('lrValue').textContent = t.lr > 0.0001 ? t.lr.toFixed(6) : t.lr.toExponential(2);
+    document.getElementById('etaValue').textContent = t.eta || '—';
+    document.getElementById('elapsedValue').textContent = `+${t.elapsed || '00:00'}`;
+
+    // Config Info
+    document.getElementById('cfgIteration').textContent = c.iteration || '?';
+    document.getElementById('cfgDModel').textContent = c.d_model || '?';
+    document.getElementById('cfgLayers').textContent = c.n_layers || '?';
+    document.getElementById('cfgParams').textContent = `${t.params_m}M` || '?';
+    document.getElementById('cfgBatch').textContent = `B=${t.batch_size} S=${t.seq_len}` || '?';
+    document.getElementById('cfgVramLimit').textContent = c.max_vram_mb ? `${c.max_vram_mb} MB` : '?';
+
+    // Checkpoint & GPU
+    document.getElementById('ckptSize').textContent = ck.size_mb ? `${ck.size_mb.toFixed(0)} MB` : '—';
+    document.getElementById('ckptAge').textContent = ck.age_min !== null ? `${ck.age_min.toFixed(0)} min` : '—';
+    document.getElementById('gpuTemp').textContent = g.gpu_temp_c ? `${g.gpu_temp_c}°C` : '—';
+    document.getElementById('gpuUtil').textContent = g.gpu_util_pct ? `${g.gpu_util_pct}%` : '—';
+
+    // Loss Chart
+    if (t.loss_history && t.loss_history.length > 0) {
+        const history = t.loss_history;
+        const stepOffset = Math.max(0, t.step - history.length);
+        const labels = history.map((_, i) => stepOffset + i);
+
+        // Downsample to max 500 points for performance
+        const maxPoints = 500;
+        let displayLabels = labels;
+        let displayData = history;
+        if (history.length > maxPoints) {
+            const step = Math.ceil(history.length / maxPoints);
+            displayLabels = labels.filter((_, i) => i % step === 0);
+            displayData = history.filter((_, i) => i % step === 0);
+        }
+
+        lossChart.data.labels = displayLabels;
+        lossChart.data.datasets[0].data = displayData;
+        lossChart.update('none');
+    }
+
+    // Generations
+    const gensDiv = document.getElementById('generationsList');
+    if (gens.length > 0) {
+        gensDiv.innerHTML = gens.map(g => `
+            <div class="gen-entry">
+                <div class="name">${g.name}</div>
+                <div class="text">${escapeHtml(g.text)}</div>
+                <div class="time">${new Date(g.time * 1000).toLocaleTimeString()}</div>
+            </div>
+        `).join('');
+    }
+
+    // Last update
+    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Auto-poll every 2 seconds
+async function poll() {
+    const data = await fetchStatus();
+    updateUI(data);
+    setTimeout(poll, 2000);
+}
+
+poll();
+</script>
+</body>
+</html>

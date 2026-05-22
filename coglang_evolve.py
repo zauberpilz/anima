@@ -169,6 +169,27 @@ def run_evolution():
                 eta_m, eta_s = divmod(eta_rem, 60)
                 
                 status = f'[{pct:5.1f}%] Step {step:5d} | loss={avg:.4f} | LR={current_lr:.6f} | VRAM={mem:.0f}MB | {speed:.1f}step/s | +{elapsed_m:02d}:{elapsed_s:02d} | ETA {eta_h:02d}:{eta_m:02d}:{eta_s:02d}'
+                
+                # PHASE 26: Live State für Dashboard (alle 10 Sekunden)
+                if int(elapsed) % 10 == 0 and last_log_time != int(elapsed):
+                    try:
+                        state = {
+                            'step': step, 'total_steps': steps_per_iter,
+                            'loss': avg, 'vram_mb': mem, 'speed': speed,
+                            'lr': current_lr, 'elapsed_s': int(elapsed),
+                            'eta_s': int(eta_secs), 'iteration': config.get('iteration', 0),
+                            'best_loss': config.get('best_loss', None),
+                            'd_model': config.get('d_model', 0),
+                            'n_layers': config.get('n_layers', 0),
+                            'params_m': brain.parameter_count() / 1e6,
+                            'batch_size': B, 'seq_len': S,
+                            'timestamp': time.time(),
+                            'loss_history': history[-500:] if len(history) > 100 else history,
+                        }
+                        with open('/home/anima/train_state.json', 'w') as sf:
+                            json.dump(state, sf)
+                    except:
+                        pass
                 print(f'\r{status}', end='', flush=True)
                 last_log_time = now
 
@@ -217,6 +238,12 @@ def run_evolution():
             brain.save_checkpoint(os.path.join(CHECKPOINT_DIR, 'best_model.pt'), config=config)
             print("Neues Best Model gespeichert!")
         
+
+        # PHASE 27: 8-bit Weight Quantization für Generation (4x weniger VRAM)
+        print("[QUANT] Quantisiere Modell für Evaluation...")
+        q_stats = brain.quantize_weights()
+        # Gemischte Präzision: Quantized für Generation, FP32 weiter für Training
+
         # PHASE 12: Online Evaluation — Automatische Quality Metriken
         gen_scores = []
         for prompt in ['ROMEO:', 'KING ']:
@@ -245,6 +272,12 @@ def run_evolution():
         
         avg_gen_score = sum(gen_scores) / len(gen_scores) if gen_scores else 0
         print(f'Generation Quality Score: {avg_gen_score:.3f}')
+        
+        # PHASE 27: Quantized Checkpoint speichern (25% Größe)
+        try:
+            brain.save_quantized_checkpoint(os.path.join(CHECKPOINT_DIR, 'quantized_checkpoint.pt'), config=config)
+        except Exception as e:
+            print(f'[QUANT] Quantized Checkpoint Fehler: {e}')
 
     except Exception as e:
         print(f'Fehler in Iteration {config["iteration"]}: {e}')

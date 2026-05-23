@@ -1,0 +1,23 @@
+{
+    "d_model": 1024,
+    "d_sparse": 2956,
+    "n_layers": 14,
+    "d_state": 256,
+    "d_context": 512,
+    "lr": 0.018275625,
+    "max_vram_mb": 7000,
+    "generation_step": 50000,
+    "best_loss": 2.866443634033203,
+    "iteration": 16,
+    "domain_weights": {
+        "code": 0.3,
+        "security": 0.2,
+        "network": 0.1,
+        "text": 0.4
+    },
+    "curriculum_enabled": true,
+    "current_phase": "integration",
+    "use_code_data": true,
+    "use_security_data": true,
+    "use_network_data": true
+}

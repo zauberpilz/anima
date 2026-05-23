@@ -329,8 +329,9 @@ def run_evolution():
     print('PHASE 30/31: Multi-Domain + Curriculum Learning')
     print('='*60)
 
-    # Use MultiDomainDataset for full multi-domain support
-    multi_domain = MultiDomainDataset(max_chars_per_domain=2000000)
+    # Multi-Domain Dataset: synthetisch + CodeAlpaca (zuverlässig, kein Download nötig)
+    # 500K Chars pro Domäne = 1.5M+ Gesamttokens
+    multi_domain = MultiDomainDataset(max_chars_per_domain=500000)
 
     # Apply domain weights from config
     for domain, weight in domain_weights.items():
@@ -436,7 +437,7 @@ def run_evolution():
             if curriculum_enabled:
                 current_domain = curriculum.get_domain_for_step(step)
                 phase_info = curriculum.get_phase(step)
-                config['current_phase'] = phase_info[1]
+                config['current_phase'] = phase_info['name']
             else:
                 current_domain = 'mixed'
                 phase_info = (0, 'mixed', 1.0)
@@ -467,13 +468,21 @@ def run_evolution():
                     batch_target = batch
 
             # -----------------------------------------------------------------
-            #  PHASE 24: Cosine Annealing LR Scheduler
+            #  PHASE 24: AGGRESSIVE LR for fresh Hebbian model
             # -----------------------------------------------------------------
-            current_lr = config['lr']
-            if step > 1000:
-                current_lr = cosine_anneal_lr(config['lr'], step, steps_per_iter * 2)
+            base_lr = config['lr']
+            # Warmup: keep LR high for first 5000 steps
+            if step < 5000:
+                warmup_factor = 0.5 + 0.5 * step / 5000
+                current_lr = base_lr * warmup_factor * 3.0
+            else:
+                current_lr = cosine_anneal_lr(base_lr, step - 5000, steps_per_iter * 2)
             for layer_idx, layer in enumerate(brain._stack.layers):
-                layer._lr = current_lr * (0.95 ** layer_idx)
+                # Hebbian LR is divided by (batch*seq)=1024 internally → lr_eff must be ~0.01
+                # So layer._lr must be ~10 for lr_eff ~0.01
+                layer._lr = current_lr * 100.0 * (0.95 ** layer_idx)
+            brain._decoder._lr = current_lr * 1.5
+            brain._sensory._lr = current_lr * 10.0  # Embeddings need big updates too
 
             # -----------------------------------------------------------------
             #  Forward pass mit OOM Recovery
@@ -585,8 +594,11 @@ def run_evolution():
                 eta_m, eta_s = divmod(eta_rem, 60)
 
                 # PHASE 30: Show curriculum phase
-                phase_name = phase_info[1] if curriculum_enabled else 'mixed'
-                phase_progress = phase_info[2] if curriculum_enabled else 1.0
+                phase_name = phase_info['name'] if curriculum_enabled and isinstance(phase_info, dict) else 'mixed'
+                if curriculum_enabled:
+                    _, _, phase_progress = curriculum.get_phase_progress(step)
+                else:
+                    phase_progress = 1.0
                 phase_str = f'| Phase={phase_name}'
 
                 status = (f'[{pct:5.1f}%] Step {step:5d} | loss={avg:.4f} | LR={current_lr:.6f} '
@@ -698,7 +710,7 @@ def run_evolution():
             print(f'Neuer Rekord! {final_loss:.4f} < {config["best_loss"]:.4f}')
             config['best_loss'] = final_loss
             if config['d_model'] < 1024:
-                config['d_model'] = min(1024, int(config['d_model'] * 1.15))
+                config['d_model'] = min(1024, (int(config['d_model'] * 1.15) // 4) * 4)
             config['n_layers'] = min(18, config['n_layers'] + 1)
             config['lr'] *= 0.95
             print(f'Evolution: d_model={config["d_model"]}, layers={config["n_layers"]}, lr={config["lr"]:.6f}')
@@ -710,7 +722,7 @@ def run_evolution():
             print(f'Kein Fortschritt ({final_loss:.4f} vs {config["best_loss"]:.4f}). Mutation.')
             config['lr'] *= 0.5
             if config['d_sparse'] > 2048:
-                config['d_sparse'] = int(config['d_sparse'] * 0.85)
+                config['d_sparse'] = max(1024, (int(config['d_sparse'] * 0.85) // 4) * 4)
         save_config(config)
 
         # Checkpoints speichern

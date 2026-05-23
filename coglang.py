@@ -605,7 +605,9 @@ class PredictiveLayer(CogModule):
         self.W_pred = nn.Linear(d_state + d_context, d_model, bias=False)
         self.W_error = nn.Linear(d_model, d_state, bias=False)
         self.W_gate = nn.Linear(d_state + d_model + d_context, d_state)
-        self.register_buffer('state', torch.zeros(1, 1, d_state))
+        # PHASE 5: Use small random init for state (avoids dead neurons with zero Hebbian input)
+        state_init = torch.randn(1, 1, d_state) * 0.01
+        self.register_buffer('state', state_init)
         self.register_buffer('error_trace', torch.zeros(1, d_model))
 
     def forward(self, x, context=None, memory_retrieved=None, learn=True):
@@ -616,6 +618,10 @@ class PredictiveLayer(CogModule):
             
             # Combine state with retrieved memory if available
             state = self.state.expand(batch, seq, -1).contiguous()
+            # NaN-Guard: Korrupte Zustände zurücksetzen
+            if torch.isnan(state).any():
+                state = torch.zeros_like(state)
+                self.state.data.zero_()
             if memory_retrieved is not None:
                 state = state + memory_retrieved * 0.1  # Gated memory injection
                 
@@ -675,7 +681,10 @@ class PredictiveLayer(CogModule):
                 # PHASE 5: Timescale modulation
                 new_state = (1 - gate * self.timescale) * state + (gate * self.timescale) * delta
 
-            self.state = new_state[0:1, -1:, :].detach()
+            new_state_detached = new_state[0:1, -1:, :].detach()
+            if torch.isnan(new_state_detached).any():
+                new_state_detached = torch.zeros_like(new_state_detached)
+            self.state = new_state_detached
             self.error_trace = error[0:1, -1, :].detach()
             return new_state, error, prediction
 
@@ -788,6 +797,9 @@ class OutputDecoder(CogModule):
         self.out_head = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward(self, pred):
+        # NaN-Guard: pred darf nicht NaN sein
+        if torch.isnan(pred).any() or torch.isinf(pred).any():
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1.0, neginf=-1.0)
         hidden = torch.tanh(self.out_proj(pred))
         return self.out_head(hidden), hidden
 

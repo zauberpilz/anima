@@ -24,8 +24,8 @@ config_file = CONFIG_FILE
 # =====================================================================
 
 class CurriculumScheduler:
-    """Manages multi-phase curriculum learning across domains."""
-    def __init__(self, total_steps=50000):
+    """Manages multi-phase curriculum learning across domains with smooth transitions."""
+    def __init__(self, total_steps=50000, transition_fraction=0.2):
         self.phases = [
             {'name': 'foundation',   'domain': 'text',     'steps': 5000,  'desc': 'Language foundation'},
             {'name': 'code_intro',   'domain': 'code',     'steps': 10000, 'desc': 'Code understanding'},
@@ -33,12 +33,21 @@ class CurriculumScheduler:
             {'name': 'network',      'domain': 'network',  'steps': 5000,  'desc': 'Traffic analysis'},
             {'name': 'integration',  'domain': 'mixed',    'steps': 20000, 'desc': 'All domains integrated'},
         ]
+        self.transition_fraction = transition_fraction  # 0.0=abrupt, 0.2=smooth over 20% of phase
         self._validate_steps(total_steps)
+        # Precompute domain order for transitions
+        self._domain_order = []
+        prev = None
+        for p in self.phases:
+            if p['domain'] != 'mixed':
+                self._domain_order.append(p['domain'])
+                prev = p['domain']
+            else:
+                self._domain_order.append('mixed')
 
     def _validate_steps(self, total_steps):
         total = sum(p['steps'] for p in self.phases)
         if total != total_steps:
-            # Scale proportionally
             scale = total_steps / max(1, total)
             for p in self.phases:
                 p['steps'] = max(1, int(p['steps'] * scale))
@@ -52,8 +61,61 @@ class CurriculumScheduler:
                 return phase
         return self.phases[-1]
 
+    def get_domain_weights(self, step):
+        """Return dict of domain weights with smooth transitions between phases.
+        
+        During the first `transition_fraction` of a new phase, the previous domain
+        is gradually blended out while the new domain is blended in.
+        This prevents catastrophic loss spikes at phase boundaries.
+        """
+        # Default: uniform weights for mixed, single domain for focused phases
+        phase = self.get_phase(step)
+        
+        if phase['domain'] == 'mixed':
+            return {'text': 0.25, 'code': 0.25, 'security': 0.25, 'network': 0.25}
+        
+        # Find where we are in the phase sequence
+        accumulated = 0
+        prev_domain = 'text'  # default fallback
+        for i, p in enumerate(self.phases):
+            phase_start = accumulated
+            phase_end = accumulated + p['steps']
+            
+            if phase_start <= step < phase_end:
+                # We're in phase p
+                domain = p['domain']
+                if domain == 'mixed':
+                    return {'text': 0.25, 'code': 0.25, 'security': 0.25, 'network': 0.25}
+                
+                # Calculate transition progress
+                progress_in_phase = (step - phase_start) / max(1, p['steps'])
+                transition_steps = int(p['steps'] * self.transition_fraction)
+                
+                if progress_in_phase < self.transition_fraction and i > 0:
+                    # Smooth blend: prev domain fades out, new domain fades in
+                    prev_phase = self.phases[i - 1]
+                    prev_domain = prev_phase['domain']
+                    if prev_domain == 'mixed':
+                        # If prev was mixed, distribute evenly
+                        blend = progress_in_phase / self.transition_fraction
+                        return {domain: blend, 'text': (1-blend)/4, 'code': (1-blend)/4,
+                                'security': (1-blend)/4, 'network': (1-blend)/4}
+                    else:
+                        blend = progress_in_phase / self.transition_fraction
+                        weights = {d: 0.0 for d in ['text', 'code', 'security', 'network']}
+                        weights[prev_domain] = 1.0 - blend
+                        weights[domain] = blend
+                        return weights
+                
+                # Fully in new domain
+                return {d: 1.0 if d == domain else 0.0 for d in ['text', 'code', 'security', 'network']}
+            
+            accumulated += p['steps']
+        
+        return {'text': 0.25, 'code': 0.25, 'security': 0.25, 'network': 0.25}
+
     def get_domain_for_step(self, step):
-        """Return the domain name to use for a given step."""
+        """Return the primary domain name for a given step."""
         return self.get_phase(step)['domain']
 
     def get_phase_progress(self, step):
@@ -432,40 +494,44 @@ def run_evolution():
     try:
         for step in range(steps_per_iter):
             # -----------------------------------------------------------------
-            #  PHASE 30: Curriculum-based domain selection
+            #  PHASE 30: Curriculum-based domain selection (SMOOTH transitions)
             # -----------------------------------------------------------------
             if curriculum_enabled:
-                current_domain = curriculum.get_domain_for_step(step)
                 phase_info = curriculum.get_phase(step)
                 config['current_phase'] = phase_info['name']
+                # Get smooth domain weights (blends domains at phase boundaries)
+                domain_weights = curriculum.get_domain_weights(step)
             else:
-                current_domain = 'mixed'
                 phase_info = (0, 'mixed', 1.0)
+                domain_weights = {'text': 0.25, 'code': 0.25, 'security': 0.25, 'network': 0.25}
 
             # -----------------------------------------------------------------
-            #  PHASE 30: Get batch from multi-domain dataset
+            #  PHASE 30: Get batch with smooth domain blending
             # -----------------------------------------------------------------
-            if current_domain == 'mixed':
-                # Mixed batch from all domains
-                batch = async_loader.get_batch()  # primary async path
-                # For mixed domain, also get domain-specific batch for multi-task loss
-                try:
-                    x_mixed, y_mixed = multi_domain.get_mixed_batch(B, S, device)
-                    batch = x_mixed  # override with properly mixed batch
-                except Exception:
-                    pass  # fallback to async_loader batch
+            # Build a mixed batch using the smooth domain weights
+            try:
+                batch_parts = []
+                target_parts = []
+                for domain, weight in domain_weights.items():
+                    if weight > 0.05:  # Only sample from active domains
+                        n_samples = max(1, int(B * weight))
+                        x_d, y_d = multi_domain.get_batch(domain, n_samples, S, device)
+                        batch_parts.append(x_d)
+                        target_parts.append(y_d)
+
+                if batch_parts:
+                    batch = torch.cat(batch_parts, dim=0)
+                    batch_target = torch.cat(target_parts, dim=0)
+                    # Shuffle within batch for domain mixing
+                    perm = torch.randperm(batch.size(0), device=device)
+                    batch = batch[perm]
+                    batch_target = batch_target[perm]
+                else:
+                    raise RuntimeError("No active domains")
+            except Exception as e:
+                # Fallback: async loader
+                batch = async_loader.get_batch()
                 batch_target = batch
-            else:
-                # Domain-specific batch
-                try:
-                    x_domain, y_domain = multi_domain.get_batch(current_domain, B, S, device)
-                    batch = x_domain
-                    batch_target = y_domain
-                except (ValueError, RuntimeError) as e:
-                    # Fallback on error
-                    print(f'\n[DATA] Domain {current_domain} Batch Fehler: {e}')
-                    batch = async_loader.get_batch()
-                    batch_target = batch
 
             # -----------------------------------------------------------------
             #  PHASE 24: AGGRESSIVE LR for fresh Hebbian model
@@ -632,8 +698,9 @@ def run_evolution():
                             'current_phase': phase_name,
                             'phase_progress': phase_progress,
                             'curriculum_enabled': curriculum_enabled,
-                            # PHASE 31: Domain-specific tracking
-                            'domain': current_domain,
+                            # PHASE 31: Domain-specific tracking (blended)
+                            'domain': phase_info['name'] if isinstance(phase_info, dict) else 'mixed',
+                            'domain_weights': domain_weights,
                             'domain_losses': {k: float(sum(v[-100:]) / max(1, len(v[-100:])))
                                               for k, v in domain_loss_history.items() if v},
                             'domain_perplexity': domain_ppl,
@@ -706,14 +773,29 @@ def run_evolution():
 
         # --- MUTATION / EVOLUTION LOGIK ---
         config['iteration'] += 1
+        
+        # Detect if architecture changed (requires fresh weights, unfair comparison)
+        arch_changed = False
+        arch_key = f"d{config['d_model']}_s{config['d_sparse']}_l{config['n_layers']}"
+        last_arch = config.get('_last_arch', '')
+        if arch_key != last_arch:
+            arch_changed = True
+            print(f'[EVOLUTION] Architektur geändert ({last_arch} -> {arch_key}). Aufwärmiteration.')
+            config['_last_arch'] = arch_key
+        
         if final_loss < config['best_loss'] * 0.99:
             print(f'Neuer Rekord! {final_loss:.4f} < {config["best_loss"]:.4f}')
             config['best_loss'] = final_loss
+            config['_best_arch'] = arch_key
             if config['d_model'] < 1024:
                 config['d_model'] = min(1024, (int(config['d_model'] * 1.15) // 4) * 4)
             config['n_layers'] = min(18, config['n_layers'] + 1)
             config['lr'] *= 0.95
             print(f'Evolution: d_model={config["d_model"]}, layers={config["n_layers"]}, lr={config["lr"]:.6f}')
+        elif arch_changed:
+            # Architecture changed - don't punish, just give next iteration fair chance
+            print(f'Aufwärmiteration abgeschlossen (best={final_loss:.4f}). Keine Mutation.')
+            config['lr'] *= 0.95  # Gentle LR decay only
         elif final_loss < config['best_loss'] * 1.05:
             print(f'Leichter Fortschritt {final_loss:.4f}. Optimiere LR.')
             config['best_loss'] = min(config['best_loss'], final_loss)
@@ -730,6 +812,43 @@ def run_evolution():
         if final_loss < config['best_loss']:
             brain.save_checkpoint(os.path.join(CHECKPOINT_DIR, 'best_model.pt'), config=config)
             print("Neues Best Model gespeichert!")
+
+        # =====================================================================
+        #  AUTO-EVALUATION: Generation Samples nach jeder Iteration
+        # =====================================================================
+        try:
+            print("\n[AUTO-EVAL] Generiere Samples...")
+            # Sample prompts from different domains
+            prompts = {
+                'text': "The future of artificial intelligence is",
+                'code': "def fibonacci(n):",
+                'security': "def check_vulnerability(code):",
+                'network': "[FLOW] src=192.168.1.1 dst=10.0.0.1",
+            }
+            eval_dir = os.path.join(CHECKPOINT_DIR, f'iter_{config["iteration"]-1}')
+            os.makedirs(eval_dir, exist_ok=True)
+            
+            for domain, prompt in prompts.items():
+                # Encode prompt
+                prompt_ids = torch.tensor([[multi_domain.stoi.get(c, 0) for c in prompt]], device=device)
+                if prompt_ids.size(1) < 10:
+                    continue
+                
+                # Generate
+                generated = brain.generate_safe(prompt_ids, max_new=100, temperature=0.8, top_k=30)
+                
+                # Decode
+                gen_text = ''.join([multi_domain.itos.get(int(i), '?') for i in generated[0]])
+                
+                # Save
+                with open(os.path.join(eval_dir, f'{domain}.txt'), 'w', encoding='utf-8') as f:
+                    f.write(f"Prompt: {prompt}\n\nGenerated:\n{gen_text}\n")
+                
+                print(f"  [{domain}] {gen_text[:120]}...")
+            
+            print("[AUTO-EVAL] Samples gespeichert in", eval_dir)
+        except Exception as eval_err:
+            print(f"[AUTO-EVAL] Fehler: {eval_err}")
 
         # PHASE 27: 8-bit Weight Quantization für Generation (4x weniger VRAM)
         print("[QUANT] Quantisiere Modell für Evaluation...")

@@ -146,17 +146,7 @@ def security_aware_loss(output, target):
     # Gather the log probabilities of the target tokens
     nll = -output_flat[torch.arange(output_flat.size(0)), target_flat]
 
-    # Identify "security-sensitive" tokens (punctuation, keywords like 'CVE', 'CWE', 'vuln')
-    security_keywords_str = 'CVE:cwe:vuln:exploit:buffer:overflow:injection:escape:patch:fix:vulnerability:malware:backdoor:rootkit:ransomware'
-    security_keywords = {ord(c) for c in security_keywords_str}
-    # Compute per-token significance
-    significance = torch.ones_like(nll)
-    for token_id in range(output.size(-1)):
-        char_val = token_id  # This is the index, which maps to a character
-        # Heuristic: tokens that appear in security contexts get boosted weight
-        pass  # Simplified: we use a fixed boost on all tokens for security domain
-
-    # Boost NLL by 2x to penalize errors more heavily in security domain
+    # Security-sensitive tokens: boost errors on security-relevant predictions
     aux_loss = nll.mean() * 0.5  # Weighted cross-entropy boost
     return aux_loss
 
@@ -462,8 +452,9 @@ def run_evolution():
     steps_per_iter = config['generation_step']
     batch_sizer = DynamicBatchSizer(initial_batch=4, initial_seq=64, max_vram_mb=config['max_vram_mb'])
     B, S = batch_sizer.get_sizes()
+    # Async Loader: wird nur im Fallback bei Batch-Fehlern aktiviert
     async_loader = AsyncDataLoader(data, B, S, device, prefetch=2)
-    async_loader.start()
+    # async_loader.start() -- Auskommentiert: Trainingsloop baut eigene Batches
 
     # PHASE 17: Resource Throttle für Surf-Kompatibilität (STARK GEDROSSELT)
     torch.backends.cudnn.benchmark = False
@@ -533,7 +524,8 @@ def run_evolution():
                 else:
                     raise RuntimeError("No active domains")
             except Exception as e:
-                # Fallback: async loader
+                print(f'[BATCH] Fehler: {e}, verwende Async-Loader Fallback')
+                async_loader.start()  # Lazy start
                 batch = async_loader.get_batch()
                 batch_target = batch
 

@@ -9,6 +9,7 @@ from training_controller import TrainingController
 CHECKPOINT_DIR = '/home/anima/checkpoints'
 CONFIG_FILE = '/home/anima/evolution_config.json'
 GENERATION_DIR = '/home/anima/generations'
+BPE_TOKENIZER_PATH = '/home/anima/tokenizer/bpe_4k.json'
 CONTROL_DIR = '/home/anima/control'
 RECOVERY_DIR = '/home/anima/recovery'
 
@@ -393,7 +394,7 @@ def run_evolution():
 
     # Multi-Domain Dataset: synthetisch + CodeAlpaca (zuverlässig, kein Download nötig)
     # 500K Chars pro Domäne = 1.5M+ Gesamttokens
-    multi_domain = MultiDomainDataset(max_chars_per_domain=500000)
+    multi_domain = MultiDomainDataset(max_chars_per_domain=500000, bpe_tokenizer_path=BPE_TOKENIZER_PATH)
 
     # Apply domain weights from config
     for domain, weight in domain_weights.items():
@@ -504,6 +505,9 @@ def run_evolution():
             else:
                 phase_info = (0, 'mixed', 1.0)
                 domain_weights = {'text': 0.25, 'code': 0.25, 'security': 0.25, 'network': 0.25}
+
+            # Set default domain (used for logging; 'mixed' when blending)
+            current_domain = 'mixed'
 
             # -----------------------------------------------------------------
             #  PHASE 30: Get batch with smooth domain blending
@@ -829,16 +833,17 @@ def run_evolution():
             os.makedirs(eval_dir, exist_ok=True)
             
             for domain, prompt in prompts.items():
-                # Encode prompt
-                prompt_ids = torch.tensor([[multi_domain.stoi.get(c, 0) for c in prompt]], device=device)
+                # Encode prompt (BPE-kompatibel)
+                encoded = multi_domain.encode(prompt)
+                prompt_ids = torch.tensor([encoded], device=device)
                 if prompt_ids.size(1) < 10:
                     continue
                 
                 # Generate
                 generated = brain.generate_safe(prompt_ids, max_new=100, temperature=0.8, top_k=30)
                 
-                # Decode
-                gen_text = ''.join([multi_domain.itos.get(int(i), '?') for i in generated[0]])
+                # Decode (BPE-kompatibel)
+                gen_text = multi_domain.decode(generated[0])
                 
                 # Save
                 with open(os.path.join(eval_dir, f'{domain}.txt'), 'w', encoding='utf-8') as f:
@@ -880,9 +885,9 @@ def run_evolution():
         for eval_key, eval_list in eval_prompts.items():
             for prompt, domain in eval_list:
                 try:
-                    ctx = torch.tensor([[stoi.get(c, 0) for c in prompt]], device=device)
+                    ctx = torch.tensor([multi_domain.encode(prompt)], device=device)
                     generated = brain.generate_safe(ctx, max_new=150, temperature=0.7, top_k=30)
-                    gen = ''.join(itos.get(int(i), '?') for i in generated[0])
+                    gen = multi_domain.decode(generated[0])
                 except Exception as e:
                     print(f'  [WARN] Generation fehlgeschlagen für "{prompt}": {e}')
                     gen = f'[GENERATION FAILED]'

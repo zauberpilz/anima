@@ -1287,7 +1287,7 @@ class CogLang:
         if self._bridge is not None:
             output = self._bridge(output, context_embedding=sparse_x)
             
-        return output, {'errors': errors, 'predictions': predictions, 'hidden': hidden, 'pred': pred, 'sparse': sparse_x}
+        return output, {'errors': errors, 'predictions': predictions, 'hidden': hidden, 'pred': pred, 'sparse': sparse_x, 'output': output}
 
     def learn(self, input_ids):
         with torch.no_grad():

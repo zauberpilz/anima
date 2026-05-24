@@ -1,6 +1,6 @@
 """
 Erweiterter Multi-Domain Data Loader für große Korpora + Code + Security + Network.
-v5: Multi-Domain Dataset Manager mit HuggingFace Integration + Dataset-Kompatibilitäts-Patches.
+v6: Multi-Domain Dataset Manager mit BPE-Tokenizer (tokenizers) + HuggingFace.
 """
 import torch
 import os
@@ -746,7 +746,7 @@ class MultiDomainDataset:
     Multi-Domain Dataset Manager — Code + Security + Network + Text.
     Verwaltet separate Domänen mit Gewichtung und shared Character Mapping.
     """
-    def __init__(self, max_chars_per_domain=5000000):
+    def __init__(self, max_chars_per_domain=5000000, bpe_tokenizer_path=None):
         self.max_chars_per_domain = max_chars_per_domain
         self.domains = {
             'code': {'weight': 0.3, 'enabled': True, 'data': None, 'source': None},
@@ -760,6 +760,16 @@ class MultiDomainDataset:
         self.data = None
         self.domain_ranges = {}
         self._loaded = False
+        # BPE Tokenizer (optional, falls None -> char-level)
+        self.bpe_tokenizer = None
+        if bpe_tokenizer_path and os.path.exists(bpe_tokenizer_path):
+            try:
+                from tokenizers import Tokenizer
+                self.bpe_tokenizer = Tokenizer.from_file(bpe_tokenizer_path)
+                self.vocab_size = self.bpe_tokenizer.get_vocab_size()
+                print(f'[BPE] Tokenizer geladen: Vocab={self.vocab_size}')
+            except Exception as e:
+                print(f'[BPE] Fehler: {e}')
 
     # -----------------------------------------------------------------
     #  LOADING
@@ -810,29 +820,52 @@ class MultiDomainDataset:
         if not all_texts:
             raise RuntimeError('[MULTI] KEINE DATEN VERFUEGBAR!')
 
-        # Shared Character Mapping über alle Domänen
-        combined_text_for_vocab = ''.join(all_texts.values())
-        self.stoi, self.itos, self.vocab_size = get_character_mapping(combined_text_for_vocab)
-
-        # Tensor-Konvertierung mit shared mapping
-        all_tensors = []
-        current_offset = 0
-        for domain_name in ['code', 'security', 'network', 'text']:
-            if domain_name in all_texts:
-                domain_text = all_texts[domain_name]
-                domain_tensor = torch.tensor(
-                    [self.stoi.get(c, 0) for c in domain_text],
-                    dtype=torch.long
-                )
-                start_idx = current_offset
-                end_idx = current_offset + len(domain_tensor)
-                self.domain_ranges[domain_name] = (start_idx, end_idx)
-                all_tensors.append(domain_tensor)
-                current_offset += len(domain_tensor)
-                weight = self.domains[domain_name]['weight']
-                print(f'[MULTI]   {domain_name:10s}: {len(domain_tensor):>10,} Tokens (weight={weight:.1f})')
-            else:
-                self.domain_ranges[domain_name] = (current_offset, current_offset)
+        # BPE oder Character-Level Tokenisierung
+        if self.bpe_tokenizer is not None:
+            # BPE Tokenizer: encode each domain separately
+            print(f'[MULTI] Tokenisiere mit BPE (Vocab={self.vocab_size})...')
+            all_tensors = []
+            current_offset = 0
+            for domain_name in ['code', 'security', 'network', 'text']:
+                if domain_name in all_texts:
+                    domain_text = all_texts[domain_name]
+                    encoded = self.bpe_tokenizer.encode(domain_text)
+                    domain_ids = encoded.ids
+                    domain_tensor = torch.tensor(domain_ids, dtype=torch.long)
+                    start_idx = current_offset
+                    end_idx = current_offset + len(domain_tensor)
+                    self.domain_ranges[domain_name] = (start_idx, end_idx)
+                    all_tensors.append(domain_tensor)
+                    current_offset += len(domain_tensor)
+                    weight = self.domains[domain_name]['weight']
+                    print(f'[MULTI]   {domain_name:10s}: {len(domain_tensor):>10,} Tokens (weight={weight:.1f})')
+                else:
+                    self.domain_ranges[domain_name] = (current_offset, current_offset)
+            # stoi/itos: Dummy-Mappings für BPE (wir nutzen tokenizer direkt)
+            self.stoi = {}  # Not used with BPE
+            self.itos = {}
+        else:
+            # Shared Character Mapping über alle Domänen (Legacy)
+            combined_text_for_vocab = ''.join(all_texts.values())
+            self.stoi, self.itos, self.vocab_size = get_character_mapping(combined_text_for_vocab)
+            all_tensors = []
+            current_offset = 0
+            for domain_name in ['code', 'security', 'network', 'text']:
+                if domain_name in all_texts:
+                    domain_text = all_texts[domain_name]
+                    domain_tensor = torch.tensor(
+                        [self.stoi.get(c, 0) for c in domain_text],
+                        dtype=torch.long
+                    )
+                    start_idx = current_offset
+                    end_idx = current_offset + len(domain_tensor)
+                    self.domain_ranges[domain_name] = (start_idx, end_idx)
+                    all_tensors.append(domain_tensor)
+                    current_offset += len(domain_tensor)
+                    weight = self.domains[domain_name]['weight']
+                    print(f'[MULTI]   {domain_name:10s}: {len(domain_tensor):>10,} Tokens (weight={weight:.1f})')
+                else:
+                    self.domain_ranges[domain_name] = (current_offset, current_offset)
 
         self.data = torch.cat(all_tensors) if all_tensors else torch.tensor([], dtype=torch.long)
         self._loaded = True
@@ -1055,6 +1088,24 @@ class MultiDomainDataset:
         info['total_tokens'] = len(self.data) if self.data is not None else 0
         info['vocab_size'] = self.vocab_size
         return info
+
+    def decode(self, token_ids):
+        """Decode token IDs back to text (supports both BPE and char-level)."""
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.tolist()
+        if isinstance(token_ids, int):
+            token_ids = [token_ids]
+        if self.bpe_tokenizer is not None:
+            return self.bpe_tokenizer.decode(token_ids)
+        else:
+            return ''.join([self.itos.get(i, '?') for i in token_ids])
+
+    def encode(self, text):
+        """Encode text to token IDs (supports both BPE and char-level)."""
+        if self.bpe_tokenizer is not None:
+            return self.bpe_tokenizer.encode(text).ids
+        else:
+            return [self.stoi.get(c, 0) for c in text]
 
 
 # =====================================================================

@@ -268,8 +268,17 @@ class CogModule(nn.Module):
         if weight in self._ewc_fisher and weight in self._ewc_optimal_params:
             fisher = self._ewc_fisher[weight]
             optimal = self._ewc_optimal_params[weight]
+            # NaN-Guard: Fisher und optimal müssen finit sein
+            if torch.isnan(fisher).any() or torch.isinf(fisher).any():
+                self._ewc_fisher[weight] = torch.zeros_like(fisher)
+                fisher = self._ewc_fisher[weight]
+            if torch.isnan(optimal).any() or torch.isinf(optimal).any():
+                self._ewc_optimal_params[weight] = weight.data.clone()
+                optimal = self._ewc_optimal_params[weight]
             # Penalty: -lambda * fisher * (current - optimal)
             penalty = -self._ewc_lambda * fisher * (weight.data - optimal)
+            if torch.isnan(penalty).any() or torch.isinf(penalty).any():
+                return  # Skip EWC wenn penalty NaN
             weight.data.add_(penalty, alpha=0.01)  # Small step to avoid instability
             
     def _ewc_update_fisher(self, weight, gradient_estimate):
@@ -288,11 +297,13 @@ class CogModule(nn.Module):
             
     def _hebbian(self, error, inp, weight, lr_eff=1.0):
         """PHASE 28: Oja's Rule Hebbian update — weight-normalizing, prevents explosion."""
-        # NaN-Guard: Bereinige Input-Tensoren
+        # NaN-Guard: Bereinige Input-Tensoren und Weight
         if torch.isnan(error).any() or torch.isinf(error).any():
             error = torch.nan_to_num(error, nan=0.0, posinf=1.0, neginf=-1.0)
         if torch.isnan(inp).any() or torch.isinf(inp).any():
             inp = torch.nan_to_num(inp, nan=0.0, posinf=1.0, neginf=-1.0)
+        if torch.isnan(weight.data).any() or torch.isinf(weight.data).any():
+            weight.data = torch.nan_to_num(weight.data, nan=0.0, posinf=1.0, neginf=-1.0)
 
         e_2d = error.reshape(-1, error.size(-1))
         i_2d = inp.reshape(-1, inp.size(-1))
@@ -619,7 +630,7 @@ class PredictiveLayer(CogModule):
             # Combine state with retrieved memory if available
             state = self.state.expand(batch, seq, -1).contiguous()
             # NaN-Guard: Korrupte Zustände zurücksetzen
-            if torch.isnan(state).any():
+            if torch.isnan(state).any() or torch.isinf(state).any():
                 state = torch.zeros_like(state)
                 self.state.data.zero_()
             if memory_retrieved is not None:
@@ -636,16 +647,25 @@ class PredictiveLayer(CogModule):
                 error_norm = (error ** 2).sum().item() ** 0.5
                 self._update_meta_plasticity(error_norm)
                 
-                # W_pred: NLMS Hebbian
+                # NaN-Guard: Error sanitize before any Hebbian update (verhindert NaN-Kaskade)
+                if torch.isnan(error).any() or torch.isinf(error).any():
+                    error = torch.nan_to_num(error, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+                # W_pred: NLMS Hebbian (hat eigenen NaN-Guard)
                 self._hebbian(error, inp, self.W_pred.weight, lr_eff)
                 
                 # W_error: Adaptive LMS Hebbian
                 delta = self.W_error(error)
+                if torch.isnan(delta).any() or torch.isinf(delta).any():
+                    delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
                 e_flat = error.reshape(-1, d)
                 d_flat = delta.reshape(-1, self.d_state)
                 error_norm = (e_flat ** 2).sum(dim=1, keepdim=True).mean() + 1e-8
                 adaptive_scale = torch.clamp(1.0 / (error_norm.sqrt() + 1e-4), 0.1, 10.0)
                 dw_err = (d_flat.T @ e_flat) / (e_flat.size(0)) * adaptive_scale
+                # NaN-Guard: Gradient auf finit prüfen
+                if torch.isnan(dw_err).any() or torch.isinf(dw_err).any():
+                    dw_err = torch.nan_to_num(dw_err, nan=0.0, posinf=0.1, neginf=-0.1)
                 
                 if self.W_error.weight not in self._momentum:
                     self._momentum[self.W_error.weight] = dw_err.clone()
@@ -657,15 +677,24 @@ class PredictiveLayer(CogModule):
                 
                 # Gate: Learnable with stabilized LR
                 gate_in = torch.cat([state, error, ctx], dim=-1)
+                if torch.isnan(gate_in).any() or torch.isinf(gate_in).any():
+                    gate_in = torch.nan_to_num(gate_in, nan=0.0, posinf=1.0, neginf=-1.0)
                 gate = torch.sigmoid(self.W_gate(gate_in))
                 # PHASE 5: Timescale modulation - slower layers update less
                 new_state = (1 - gate * self.timescale) * state + (gate * self.timescale) * delta
+                
+                # NaN-Guard: new_state auf finit prüfen
+                if torch.isnan(new_state).any() or torch.isinf(new_state).any():
+                    new_state = torch.nan_to_num(new_state, nan=0.0, posinf=1.0, neginf=-1.0)
                 
                 # Hebbian update for W_gate
                 gate_error = (new_state - state)
                 g_flat = gate_in.reshape(-1, gate_in.size(-1))
                 ge_flat = gate_error.reshape(-1, self.d_state)
                 dw_gate = (ge_flat.T @ g_flat) / (g_flat.size(0))
+                # NaN-Guard: Gradient auf finit prüfen
+                if torch.isnan(dw_gate).any() or torch.isinf(dw_gate).any():
+                    dw_gate = torch.nan_to_num(dw_gate, nan=0.0, posinf=0.1, neginf=-0.1)
                 
                 if self.W_gate.weight not in self._momentum:
                     self._momentum[self.W_gate.weight] = dw_gate.clone()
@@ -675,17 +704,29 @@ class PredictiveLayer(CogModule):
                 self.W_gate.weight.data.add_(self._momentum[self.W_gate.weight], alpha=lr_eff * 0.05)
                 self.W_gate.weight.data.clamp_(-0.5, 0.5)
             else:
+                # NaN-Guard: Error und delta sanitizen
+                if torch.isnan(error).any() or torch.isinf(error).any():
+                    error = torch.nan_to_num(error, nan=0.0, posinf=1.0, neginf=-1.0)
                 delta = self.W_error(error)
+                if torch.isnan(delta).any() or torch.isinf(delta).any():
+                    delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
                 gate_in = torch.cat([state, error, ctx], dim=-1)
+                if torch.isnan(gate_in).any() or torch.isinf(gate_in).any():
+                    gate_in = torch.nan_to_num(gate_in, nan=0.0, posinf=1.0, neginf=-1.0)
                 gate = torch.sigmoid(self.W_gate(gate_in))
                 # PHASE 5: Timescale modulation
                 new_state = (1 - gate * self.timescale) * state + (gate * self.timescale) * delta
+                if torch.isnan(new_state).any() or torch.isinf(new_state).any():
+                    new_state = torch.nan_to_num(new_state, nan=0.0, posinf=1.0, neginf=-1.0)
 
             new_state_detached = new_state[0:1, -1:, :].detach()
             if torch.isnan(new_state_detached).any():
                 new_state_detached = torch.zeros_like(new_state_detached)
             self.state = new_state_detached
-            self.error_trace = error[0:1, -1, :].detach()
+            error_trace = error[0:1, -1, :].detach()
+            if torch.isnan(error_trace).any() or torch.isinf(error_trace).any():
+                error_trace = torch.zeros_like(error_trace)
+            self.error_trace = error_trace
             return new_state, error, prediction
 
     def reset_state(self, batch_size=1, device='cpu'):

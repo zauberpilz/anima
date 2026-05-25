@@ -439,6 +439,11 @@ def run_evolution():
     except RuntimeError as e:
         if "size mismatch" in str(e) or "Missing key" in str(e):
             print(f"[EVOLUTION] Architektur geändert ({e}). Starte mit frischen Gewichten.")
+            # 🔴 KRITISCH: LR beim Neustart zurücksetzen!
+            # Der gespeicherte Config-LR ist extrem niedrig (cosine runtergesetzt).
+            # Ein frisches Modell braucht mindestens 100× höhere LR zum Lernen.
+            config['lr'] = max(config['lr'], 0.05)
+            print(f"[EVOLUTION] LR auf {config['lr']:.6f} zurückgesetzt (frischer Start)")
         else:
             raise e
 
@@ -532,7 +537,7 @@ def run_evolution():
             # -----------------------------------------------------------------
             #  PHASE 24: AGGRESSIVE LR for fresh Hebbian model
             # -----------------------------------------------------------------
-            base_lr = config['lr']
+            base_lr = max(config['lr'], 0.05)  # 🔴 NIEMALS unter 0.05 fallen
             # Warmup: keep LR high for first 5000 steps
             if step < 5000:
                 warmup_factor = 0.5 + 0.5 * step / 5000

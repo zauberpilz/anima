@@ -864,6 +864,8 @@ def run_evolution():
                             'reasoning': brain._system2_reasoning.get_reasoning_stats() if hasattr(brain, '_system2_reasoning') and brain._system2_reasoning is not None else {},
                             # PHASE 46: Imagination & Planning Stats
                             'imagination': brain._imagination.get_imagination_stats() if hasattr(brain, '_imagination') and brain._imagination is not None else {},
+                            # PHASE 47: Exploration Drive Stats
+                            'exploration': brain._exploration.get_exploration_stats() if hasattr(brain, '_exploration') and brain._exploration is not None else {},
                         }
                         with open('/home/anima/train_state.json', 'w') as sf:
                             json.dump(state, sf)

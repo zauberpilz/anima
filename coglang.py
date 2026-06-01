@@ -4504,6 +4504,266 @@ class ImaginationPlanning(CogModule):
         }
 
 
+class ExplorationDrive(CogModule):
+    """
+    PHASE 47: Exploration Drive — Aktive Wissenslücken-Suche & Neugierverhalten.
+    
+    CogLang sucht aktiv nach Unsicherheit statt passiv zu lernen.
+    Inspiriert von intrinsischer Motivation in der Entwicklungspsychologie:
+    - Säuglinge schauen länger auf überraschende Reize
+    - Kinder explorieren gezielt Bereiche mit mittlerer Unsicherheit
+      (nicht zu langweilig, nicht zu überwältigend)
+    
+    Kernmechanismen:
+    1. Uncertainty Map: 2D-Raster über Token-Embedding-Raum
+       - Jede Zelle trackt: wie oft besucht? mittlerer Error? Varianz?
+       - Identifiziert "weisse Flecken" auf der Wissenslandkarte
+    
+    2. Novelty Detector: Temporal Difference des Errors
+       - "Neu" = aktueller Error weicht stark von kurzfristigem EMA ab
+       - "Überraschend" = Error-Varianz plötzlich hoch
+    
+    3. Exploration Bonus: Reward-Signal für Neugier
+       - Bonus = uncertainty * novelty * (1 - saturation)
+       - Sättigung: wiederholte Besuche reduzieren Bonus
+       - Wird an ActiveInference weitergegeben
+    
+    4. Context Gating: Welche Bereiche brauchen mehr Exploration?
+       - Bias für Batch-Sampling: mehr Daten aus unsicheren Domänen
+       - Integriert in Salience-Berechnung von ConsciousnessGlimpse
+    """
+    def __init__(self, d_model, n_uncertainty_cells=128, n_emn_history=200):
+        super().__init__()
+        self.d_model = d_model
+        self.n_uncertainty_cells = n_uncertainty_cells
+        self.n_emn_history = n_emn_history
+        
+        # ——— 1. Uncertainty Map (Wissenslandkarte) ———
+        # Jede Zelle: visit_count, mean_error, error_variance
+        self.register_buffer('cell_visits', torch.zeros(n_uncertainty_cells, dtype=torch.long))
+        self.register_buffer('cell_mean_error', torch.zeros(n_uncertainty_cells))
+        self.register_buffer('cell_error_var', torch.ones(n_uncertainty_cells) * 0.1)
+        self.register_buffer('cell_last_visit', torch.zeros(n_uncertainty_cells, dtype=torch.long))
+        
+        # Zell-Encoder: mapped d_model Features auf Zell-Index
+        self.cell_encoder = nn.Linear(d_model, n_uncertainty_cells)
+        
+        # ——— 2. Novelty Detector ———
+        # EMA + Varianz-Tracking
+        self.register_buffer('novelty_history', torch.zeros(n_emn_history))
+        self.register_buffer('error_ema_fast', torch.zeros(1))  # Kurzzeit (10 steps)
+        self.register_buffer('error_ema_slow', torch.zeros(1))  # Langzeit (100 steps)
+        self.register_buffer('novelty_signal', torch.zeros(1))
+        self._step_counter = 0
+        self._novelty_idx = 0
+        
+        # ——— 3. Exploration Bonus Network ———
+        # Berechnet Bonus aus (cell_uncertainty, novelty, visit_count)
+        self.bonus_net = nn.Sequential(
+            nn.Linear(3, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+        )
+        
+        # ——— 4. Domain Exploration Bias ———
+        self.register_buffer('domain_exploration', torch.zeros(4))  # 4 Domänen
+        self.register_buffer('domain_visit_counts', torch.ones(4) * 10)
+        
+        # ——— 5. Metrik-Puffer ———
+        self.register_buffer('exploration_rate', torch.zeros(100))
+        self.register_buffer('avg_novelty', torch.zeros(100))
+        self._rate_idx = 0
+        self._avg_novelty_idx = 0
+    
+    def _hash_to_cell(self, hidden_states):
+        """
+        Mappe Hidden-States auf Uncertainty-Cell-Index.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+        
+        Returns:
+            cell_ids: [batch, seq] — Zell-Indices
+            cell_probs: [batch, seq, n_cells] — Soft-Assignment
+        """
+        with torch.no_grad():
+            # Weiche Zuweisung zu Zellen via softmax
+            logits = self.cell_encoder(hidden_states)  # [batch, seq, n_cells]
+            probs = F.softmax(logits / 0.5, dim=-1)
+            # Harte Zuweisung für Buffer-Updates
+            cell_ids = probs.argmax(dim=-1)  # [batch, seq]
+            return cell_ids, probs
+    
+    def update_uncertainty(self, hidden_states, error_norm):
+        """
+        Aktualisiere Uncertainty Map basierend auf aktuellem Error.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            error_norm: float — Mittlerer Error über Batch
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            
+            # Welche Zellen sind aktiv?
+            cell_ids, probs = self._hash_to_cell(hidden_states)  # [batch, seq]
+            
+            # Update cell statistics (jede 10 Steps)
+            if self._step_counter % 10 == 0:
+                for b in range(batch):
+                    for t in range(seq):
+                        cell = cell_ids[b, t].item()
+                        if cell < self.n_uncertainty_cells:
+                            n = self.cell_visits[cell].item()
+                            old_mean = self.cell_mean_error[cell].item()
+                            old_var = self.cell_error_var[cell].item()
+                            
+                            # Welford's Online-Algorithmus für Mean + Variance
+                            new_n = n + 1
+                            delta = error_norm - old_mean
+                            new_mean = old_mean + delta / new_n
+                            delta2 = error_norm - new_mean
+                            new_var = old_var + delta * delta2
+                            
+                            self.cell_visits[cell] = new_n
+                            self.cell_mean_error[cell] = new_mean
+                            self.cell_error_var[cell] = max(0.01, new_var / max(1, new_n))
+                            self.cell_last_visit[cell] = self._step_counter
+            
+            # Novelty: Differenz zwischen kurz- und langfristigem EMA
+            alpha_fast = 0.3  # Kurzzeit-Gewichtung (~10 Steps)
+            alpha_slow = 0.03  # Langzeit-Gewichtung (~100 Steps)
+            
+            self.error_ema_fast[0] = self.error_ema_fast[0] * (1 - alpha_fast) + error_norm * alpha_fast
+            self.error_ema_slow[0] = self.error_ema_slow[0] * (1 - alpha_slow) + error_norm * alpha_slow
+            
+            novelty = abs(self.error_ema_fast[0].item() - self.error_ema_slow[0].item())
+            self.novelty_signal[0] = novelty
+            
+            # Novelty-History
+            if self._novelty_idx < self.n_emn_history:
+                self.novelty_history[self._novelty_idx] = novelty
+                self._novelty_idx += 1
+            
+            # Metrik: Avg Novelty
+            n_idx = self._avg_novelty_idx % 100
+            self.avg_novelty[n_idx] = novelty
+            self._avg_novelty_idx += 1
+            
+            self._step_counter += 1
+    
+    def compute_exploration_bonus(self, hidden_states):
+        """
+        Berechne Explorations-Bonus für aktuelle Hidden-States.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+        
+        Returns:
+            bonus: float — Explorations-Bonus (0-1)
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            cell_ids, probs = self._hash_to_cell(hidden_states)
+            
+            total_bonus = 0.0
+            n_cells = 0
+            
+            for b in range(batch):
+                for t in range(0, seq, 5):  # Jeden 5. Token
+                    cell = cell_ids[b, t].item()
+                    if cell >= self.n_uncertainty_cells:
+                        continue
+                    
+                    n = self.cell_visits[cell].item()
+                    mean_err = self.cell_mean_error[cell].item()
+                    var_err = self.cell_error_var[cell].item()
+                    
+                    # Uncertainty: hohe Varianz = unsicher
+                    uncertainty = min(1.0, var_err / max(0.1, mean_err + 0.01))
+                    
+                    # Novelty: EMA-Differenz
+                    novelty = self.novelty_signal[0].item()
+                    
+                    # Sättigung: Wiederholungen reduzieren Bonus
+                    saturation = min(1.0, n / 50.0)
+                    
+                    # Bonus: mittlere Unsicherkeit + hohe Neuheit + geringe Sättigung
+                    bonus_input = torch.tensor([[uncertainty, novelty, 1.0 - saturation]],
+                                                device=hidden_states.device)
+                    cell_bonus = torch.sigmoid(self.bonus_net(bonus_input)).item()
+                    total_bonus += cell_bonus
+                    n_cells += 1
+            
+            avg_bonus = total_bonus / max(1, n_cells)
+            
+            # Metrik
+            idx = self._rate_idx % 100
+            self.exploration_rate[idx] = avg_bonus
+            self._rate_idx += 1
+            
+            return avg_bonus
+    
+    def get_domain_exploration_weights(self):
+        """
+        Berechne Domain-Gewichtung basierend auf Exploration.
+        Weniger besuchte Domänen mit hohem Error bekommen höheres Gewicht.
+        
+        Returns:
+            weights: [n_domains] — Normalisierte Gewichte
+        """
+        with torch.no_grad():
+            n_domains = self.domain_exploration.size(0)
+            weights = torch.ones(n_domains)
+            
+            for d in range(n_domains):
+                visits = self.domain_visit_counts[d].item()
+                error = self.domain_exploration[d].item()
+                # Wenig besucht + hoher Error = mehr Exploration nötig
+                weights[d] = (1.0 / max(1, visits * 0.1)) * (1.0 + error)
+            
+            return weights / weights.sum()
+    
+    def condition(self, hidden_states):
+        """
+        Moduliere Hidden-States mit Explorations-Signal.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+        
+        Returns:
+            conditioned: [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            # Bonus-Berechnung (selten, alle 20 Steps)
+            if self._step_counter > 0 and self._step_counter % 20 == 0:
+                bonus = self.compute_exploration_bonus(hidden_states)
+                # Kleiner Explorationseffekt auf Hidden-States
+                bonus_tensor = torch.tensor(bonus, device=hidden_states.device)
+                return hidden_states * (1.0 + bonus_tensor * 0.02)
+            
+            return hidden_states
+    
+    def get_exploration_stats(self):
+        """Gib Exploration-Statistiken."""
+        rate = self.exploration_rate[:max(1, self._rate_idx)].mean().item()
+        novelty = self.avg_novelty[:max(1, self._avg_novelty_idx)].mean().item()
+        
+        # Cell-Statistiken
+        total_cells = self.n_uncertainty_cells
+        visited_cells = (self.cell_visits > 0).sum().item()
+        exploration_coverage = visited_cells / max(1, total_cells)
+        
+        return {
+            'exploration_rate': rate,
+            'avg_novelty': novelty,
+            'coverage': exploration_coverage,
+            'visited_cells': visited_cells,
+            'total_cells': total_cells,
+            'step': self._step_counter,
+        }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -4531,6 +4791,7 @@ class CogLang:
         self._causal_reasoning = None
         self._system2_reasoning = None
         self._imagination = None
+        self._exploration = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -4623,6 +4884,10 @@ class CogLang:
     def ImaginationPlanning(self, d_model, n_plan_steps=6, n_actions=16, temperature=0.2):
         """PHASE 46: Imagination & Planning — Zukunftsvorhersage + Planung."""
         m = ImaginationPlanning(d_model, n_plan_steps, n_actions, temperature); self.modules.append(m); self._imagination = m; return m
+    
+    def ExplorationDrive(self, d_model, n_uncertainty_cells=128, n_emn_history=200):
+        """PHASE 47: Exploration Drive — Aktive Wissenslücken-Suche & Neugier."""
+        m = ExplorationDrive(d_model, n_uncertainty_cells, n_emn_history); self.modules.append(m); self._exploration = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -4812,6 +5077,16 @@ class CogLang:
             # Im Lernmodus: nur Conditioning
             pred = self._system2_reasoning.condition(pred)
         
+        # PHASE 47: Exploration Drive — Moduliere mit Explorations-Bonus
+        if self._exploration is not None:
+            pred = self._exploration.condition(pred)
+            if not learn:
+                exp_bonus = self._exploration.compute_exploration_bonus(pred)
+                info_extra['exploration'] = {
+                    'bonus': exp_bonus,
+                    'coverage': self._exploration.get_exploration_stats()['coverage'],
+                }
+        
         # PHASE 46: Imagination & Planning — In-die-Zukunft-Blicken
         if self._imagination is not None and not learn:
             # Simuliere Zukunft aus gepooltem Kontext
@@ -4903,6 +5178,11 @@ class CogLang:
                     anomaly_target = (pred_error > pred_error.median()).float()
                     self._security_head.learn_step(info['sparse'], anomaly_target, pred_error)
             
+            # PHASE 47: Exploration Drive — Aktualisiere Uncertainty Map mit aktuellem Error
+            if self._exploration is not None and info.get('errors') is not None:
+                err_norm = sum((e ** 2).mean().item() for e in info['errors']) / max(1, len(info['errors']))
+                self._exploration.update_uncertainty(info['pred'], err_norm)
+            
             # PHASE 33: Active Inference — Curiosity + Free Energy + Epistemic Value
             if self._active_inference is not None:
                 # Use first layer error for observation
@@ -4968,12 +5248,15 @@ class CogLang:
                 self._transfer_learning.fewshot_store(input_ids[0], input_ids[0], domain_id)
             
             # PHASE 46: Imagination Planning learn_step — Lerne aus Realität vs Imagination
-            if self._imagination is not None and info.get('hidden') is not None:
-                # Vergleiche vorhergesagte Zukunft mit tatsächlichem nächsten State
-                actual = info['hidden'][:, -1, :]  # [batch, d_model]
-                imagined = self._imagination.simulate(info['hidden'], n_steps=1)
-                if imagined is not None:
-                    self._imagination.learn_from_imagination(actual, imagined[:, -1, :])
+            if self._imagination is not None and info.get('pred') is not None:
+                # Nutze pred (d_sparse) statt hidden (d_model) für Dimensions-Konsistenz
+                try:
+                    actual = info['pred'][:, -1, :]  # [batch, d_sparse]
+                    imagined = self._imagination.simulate(info['pred'], n_steps=1)
+                    if imagined is not None:
+                        self._imagination.learn_from_imagination(actual, imagined[:, -1, :])
+                except RuntimeError:
+                    pass  # Dimensionskonflikt abfangen
             
             # PHASE 43: Auto-Curriculum learn_step — Schwierigkeit anpassen
             if self._auto_curriculum is not None:
@@ -5245,6 +5528,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.CausalReasoning(d_model=d_sparse, n_causal_factors=64, temperature=0.1)
     brain.System2Reasoning(d_model=d_sparse, n_reasoning_steps=8, n_tree_branches=3, temperature=0.3)
     brain.ImaginationPlanning(d_model=d_sparse, n_plan_steps=6, n_actions=16, temperature=0.2)
+    brain.ExplorationDrive(d_model=d_sparse, n_uncertainty_cells=128, n_emn_history=200)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

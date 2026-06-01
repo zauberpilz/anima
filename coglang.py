@@ -149,6 +149,7 @@ class DynamicBatchSizer:
         self.seq = initial_seq
         self.max_vram_mb = max_vram_mb
         self.oom_count = 0
+        self.max_batch = 8  # Hard cap: B=16 verursacht OOM auf 8GB GPU mit 45% Fraction
         
     def adjust(self, vram_used_mb):
         """Adjust batch/seq based on VRAM usage."""
@@ -158,9 +159,9 @@ class DynamicBatchSizer:
             self.seq = max(32, self.seq // 2)
             self.oom_count += 1
         elif vram_used_mb < self.max_vram_mb * 0.5 and self.oom_count == 0:
-            # Plenty of VRAM -> increase
-            self.batch = min(32, self.batch * 2)
-            self.seq = min(512, self.seq * 2)
+            # Plenty of VRAM -> increase (aber hard cap beachten)
+            self.batch = min(self.max_batch, self.batch * 2)
+            self.seq = min(256, self.seq * 2)
             
     def get_sizes(self):
         return self.batch, self.seq

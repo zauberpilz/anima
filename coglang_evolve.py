@@ -573,6 +573,12 @@ def run_evolution():
                     B, S = new_B, new_S
                     async_loader.batch_size = B
                     async_loader.seq_length = S
+                    # DynamicBatchSizer OOM-Counter setzen (verhindert sofortiges Hochskalieren)
+                    batch_sizer.oom_count += 1
+                    # Batch-Progression zurücksetzen: nie mehr als 8er Batch automatisch
+                    if B >= 8:
+                        batch_sizer.batch = B
+                        batch_sizer.seq = S
 
                     # Recovery checkpoint
                     if not recovery_checkpoint_saved:

@@ -8,7 +8,7 @@
 
 ## 📊 Architektur-Übersicht
 
-CogLang v3 ist eine vollständige AGI-Architektur mit **21 implementierten Phasen**:
+CogLang v3 ist eine vollständige AGI-Architektur mit **25 implementierten Phasen**:
 
 | Phase | Feature | Beschreibung |
 |-------|---------|--------------|

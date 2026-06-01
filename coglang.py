@@ -3306,6 +3306,238 @@ class TransferLearning(CogModule):
         return stats
 
 
+class ConsciousnessGlimpse(CogModule):
+    """
+    PHASE 42: Consciousness Glimpse — Global Workspace Attention Broadcasting.
+    
+    Inspiriert von Baars' Global Workspace Theory:
+    - Ein 'Bewusstseinsinhalt' wird aus den verarbeiteten Informationen ausgewählt
+    - Dieser Inhalt wird an alle Module 'ausgestrahlt' (Broadcast)
+    - Module, die den Inhalt relevant finden, passen ihre Verarbeitung an
+    
+    Implementierung:
+    1. Salience-Detektor: Finde überraschende/neuartige/relevante Positionen
+    2. Spotlight: Wähle die Top-k salientesten Stellen aus
+    3. Global Broadcast: Verteile den ausgewählten Inhalt auf alle Hidden-States
+    4. Recurrent Processing: Der Broadcast beeinflusst den nächsten Forward-Pass
+    """
+    def __init__(self, d_model, spotlight_size=1, n_glimpses=3):
+        super().__init__()
+        self.d_model = d_model
+        self.spotlight_size = spotlight_size
+        self.n_glimpses = n_glimpses
+        
+        # ——— Salience Detector ———
+        # Bewertet jede Position nach Wichtigkeit
+        self.salience_net = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid(),
+        )
+        
+        # ——— Global Broadcast ———
+        # Projiziere Spotlight-Inhalt in den gesamten Sequenz-Raum
+        self.broadcast_net = nn.Linear(d_model, d_model, bias=False)
+        self.broadcast_gate = nn.Linear(d_model * 2, d_model)
+        
+        # ——— Recurrent Bias ———
+        # Speichert letzten Broadcast für zeitliche Kohärenz
+        self.register_buffer('last_broadcast', torch.zeros(1, d_model))
+        self.register_buffer('broadcast_coherence', torch.zeros(100))
+        self._coherence_idx = 0
+        
+        # ——— Metrik ———
+        self.register_buffer('spotlight_entropy', torch.zeros(100))
+        self.register_buffer('glimpse_count', torch.zeros(1, dtype=torch.long))
+        self._entropy_idx = 0
+    
+    def compute_salience(self, hidden_states, prediction_errors):
+        """
+        Berechne Salience (Wichtigkeit) für jede Position.
+        
+        Salience = f(hidden_state, prediction_error)
+        Höherer Error → höhere Salience (Überraschung)
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            prediction_errors: list of [batch, seq, d_model]
+        
+        Returns:
+            salience: [batch, seq]
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            
+            if not prediction_errors:
+                return torch.zeros(batch, seq, device=hidden_states.device)
+            
+            # Aggregiere Errors (mittlere Schicht)
+            error = sum(prediction_errors) / len(prediction_errors)
+            error_magnitude = error.norm(dim=-1, keepdim=True)  # [batch, seq, 1]
+            
+            # Kombiniere Hidden + Error
+            feat = torch.cat([hidden_states, error_magnitude.expand(-1, -1, d)], dim=-1)
+            
+            # Salience-Score
+            score = self.salience_net(feat).squeeze(-1)  # [batch, seq]
+            
+            # Normalisiere über Sequenz
+            score = score / (score.sum(dim=-1, keepdim=True) + 1e-8)
+            
+            return score
+    
+    def spotlight(self, hidden_states, salience):
+        """
+        Wähle die Top-k salientesten Positionen aus (Bewusstseinsinhalt).
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            salience: [batch, seq]
+        
+        Returns:
+            content: [batch, spotlight_size, d_model]
+            indices: [batch, spotlight_size]
+            weights: [batch, spotlight_size]
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            k = min(self.spotlight_size, seq)
+            
+            # Top-k Salience
+            weights, indices = torch.topk(salience, k, dim=-1)  # [batch, k]
+            
+            # Sammle Hidden-States an diesen Positionen
+            content = torch.gather(
+                hidden_states, 1,
+                indices.unsqueeze(-1).expand(-1, -1, d)
+            )  # [batch, k, d]
+            
+            # Metrik: Entropie der Salience-Verteilung
+            entropy = -(salience * torch.log(salience + 1e-8)).sum(dim=-1).mean()
+            idx = self._entropy_idx % 100
+            self.spotlight_entropy[idx] = entropy.item()
+            self._entropy_idx += 1
+            
+            return content, indices, weights
+    
+    def broadcast(self, hidden_states, spotlight_content, spotlight_weights=None):
+        """
+        Strahle den Bewusstseinsinhalt auf alle Hidden-States aus.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            spotlight_content: [batch, k, d_model]
+            spotlight_weights: [batch, k] oder None
+        
+        Returns:
+            broadcasted: [batch, seq, d_model]
+            broadcast_signal: [batch, 1, d_model] (für Metrik)
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            k = spotlight_content.size(1)
+            
+            # Gewichtete Summe des Spotlight-Inhalts
+            if spotlight_weights is not None:
+                w = torch.softmax(spotlight_weights, dim=-1)  # [batch, k]
+                broadcast_signal = (w.unsqueeze(-1) * spotlight_content).sum(dim=1, keepdim=True)
+            else:
+                broadcast_signal = spotlight_content.mean(dim=1, keepdim=True)  # [batch, 1, d]
+            
+            # Broadcast auf gesamte Sequenz
+            broadcast_exp = broadcast_signal.expand(-1, seq, -1)  # [batch, seq, d]
+            broadcast_proj = self.broadcast_net(broadcast_exp)
+            
+            # Gate: Wie viel Broadcast soll durchkommen?
+            gate_in = torch.cat([hidden_states, broadcast_proj], dim=-1)
+            gate = torch.sigmoid(self.broadcast_gate(gate_in))
+            
+            broadcasted = hidden_states + gate * broadcast_proj * 0.2
+            
+            # Aktualisiere Recurrent Bias
+            self.last_broadcast = broadcast_signal[0:1].detach()
+            
+            return broadcasted, broadcast_signal
+    
+    def glimpse(self, hidden_states, prediction_errors):
+        """
+        Führe einen vollständigen 'Consciousness Glimpse' durch.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            prediction_errors: list of [batch, seq, d_model]
+        
+        Returns:
+            updated_hidden: [batch, seq, d_model]
+            glimpse_info: dict
+        """
+        with torch.no_grad():
+            self.glimpse_count += 1
+            
+            # 1. Salience berechnen
+            salience = self.compute_salience(hidden_states, prediction_errors)
+            
+            # 2. Spotlight
+            content, indices, weights = self.spotlight(hidden_states, salience)
+            
+            # 3. Broadcast
+            broadcasted, signal = self.broadcast(hidden_states, content, weights)
+            
+            # 4. Kohärenz: Ähnlichkeit zum letzten Broadcast
+            if self.glimpse_count.item() > 1:
+                coherence = F.cosine_similarity(
+                    self.last_broadcast, signal[0:1], dim=-1
+                ).item()
+                idx = self._coherence_idx % 100
+                self.broadcast_coherence[idx] = (coherence + 1) / 2  # [0, 1]
+                self._coherence_idx += 1
+            else:
+                coherence = 0.0
+            
+            return broadcasted, {
+                'salience': salience,
+                'spotlight_indices': indices,
+                'spotlight_weights': weights,
+                'broadcast_coherence': coherence,
+                'spotlight_entropy': self.spotlight_entropy[max(0, self._entropy_idx-1)].item(),
+                'n_glimpses': self.glimpse_count.item(),
+            }
+    
+    def condition(self, hidden_states):
+        """
+        Wende letzten Broadcast als Conditioning an (für nächsten Schritt).
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+        
+        Returns:
+            conditioned: [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            if self.last_broadcast.abs().sum() < 0.01:
+                return hidden_states
+            
+            batch, seq, d = hidden_states.shape
+            last_bc = self.last_broadcast.expand(batch, seq, -1)
+            
+            gate_in = torch.cat([hidden_states, last_bc], dim=-1)
+            gate = torch.sigmoid(self.broadcast_gate(gate_in))
+            
+            return hidden_states + gate * last_bc * 0.1
+    
+    def get_consciousness_stats(self):
+        """Gib Consciousness-Statistiken zurück."""
+        recent_coherence = self.broadcast_coherence[:max(1, self._coherence_idx)]
+        recent_entropy = self.spotlight_entropy[:max(1, self._entropy_idx)]
+        return {
+            'broadcast_coherence': recent_coherence.mean().item(),
+            'spotlight_entropy': recent_entropy.mean().item(),
+            'n_glimpses': self.glimpse_count.item(),
+            'spotlight_size': self.spotlight_size,
+        }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -3328,6 +3560,7 @@ class CogLang:
         self._tool_use = None
         self._multi_agent = None
         self._transfer_learning = None
+        self._consciousness = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -3400,6 +3633,10 @@ class CogLang:
     def TransferLearning(self, d_model, max_domains=8, adapter_rank=8):
         """PHASE 41: Transfer Learning — Domain-Adaptation + Few-Shot."""
         m = TransferLearning(d_model, max_domains, adapter_rank); self.modules.append(m); self._transfer_learning = m; return m
+    
+    def ConsciousnessGlimpse(self, d_model, spotlight_size=1, n_glimpses=3):
+        """PHASE 42: Consciousness Glimpse — Global Workspace Broadcasting."""
+        m = ConsciousnessGlimpse(d_model, spotlight_size, n_glimpses); self.modules.append(m); self._consciousness = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -3489,6 +3726,15 @@ class CogLang:
             # NaN-Guard: Sichere Predictions
             predictions = [torch.nan_to_num(p, nan=0.0, posinf=1.0, neginf=-1.0) for p in predictions]
             pred = self._stack.mixed_prediction(predictions)
+        
+        # PHASE 42: Consciousness Glimpse — Global Workspace Broadcasting
+        if self._consciousness is not None and errors is not None:
+            # Berechne Salience aus Hidden-States und Prediction Errors
+            pred, glimpse_info = self._consciousness.glimpse(pred, errors)
+            info_extra['consciousness'] = glimpse_info
+        elif self._consciousness is not None:
+            # Ohne Errors: nur Condition mit letztem Broadcast
+            pred = self._consciousness.condition(pred)
         
         # PHASE 14: SkillModule transformation - modulates hidden state BEFORE decoder
         # SkillModule arbeitet auf d_sparse-Dimension (pred), nicht auf vocab-Logits
@@ -3939,6 +4185,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.ToolUse(d_model=d_sparse, max_tool_history=64)
     brain.MultiAgent(d_model=d_sparse, n_personas=2)
     brain.TransferLearning(d_model=d_sparse, max_domains=8, adapter_rank=8)
+    brain.ConsciousnessGlimpse(d_model=d_sparse, spotlight_size=1, n_glimpses=3)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

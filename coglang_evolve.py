@@ -711,6 +711,33 @@ def run_evolution():
                     if advanced:
                         print(f'[CURRICULUM] Plateau bei Step {step}, Loss={loss_val:.4f}')
 
+            # PHASE 38: Knowledge Graph — Lerne Triples aus Trainingsdaten
+            if hasattr(brain, '_knowledge_graph') and brain._knowledge_graph is not None and step % 50 == 0:
+                kg = brain._knowledge_graph
+                # Extrahiere (sub, rel, obj)-Patterns aus Batch-IDs
+                batch_np = batch[0].cpu().numpy()[:32]  # erste 32 Tokens
+                for pos in range(len(batch_np) - 2):
+                    sub, rel, obj = int(batch_np[pos]) % 1024, int(batch_np[pos+1]) % 64, int(batch_np[pos+2]) % 1024
+                    kg.store_triple(sub, rel, obj, score=0.5)
+                # Auch aus Output: was das Modell vorhersagt
+                if output is not None:
+                    pred_ids = output.argmax(dim=-1)[0, :16].cpu().numpy()
+                    for pos in range(len(pred_ids) - 2):
+                        sub, rel, obj = int(pred_ids[pos]) % 1024, int(pred_ids[pos+1]) % 64, int(pred_ids[pos+2]) % 1024
+                        kg.store_triple(sub, rel, obj, score=0.3)
+            
+            # PHASE 43: Auto-Curriculum — Passe Difficulty alle 200 Steps an
+            if hasattr(brain, '_auto_curriculum') and brain._auto_curriculum is not None:
+                brain._auto_curriculum.record_loss(loss_val)
+                if step % 200 == 0 and step > 500:
+                    brain._auto_curriculum.adapt_difficulty()
+                    ac_params = brain._auto_curriculum.get_curriculum_params()
+                    if ac_params['difficulty_level'] > 0:
+                        seq_target = ac_params['seq_len']
+                        if S != seq_target:
+                            S = max(16, min(128, seq_target))
+                            print(f'\n[AUTO-CURRICULUM] Seq-Len auf {S} gesetzt ({ac_params["difficulty_name"]})')
+            
             # Track domain-specific loss
             if current_domain in domain_loss_history:
                 domain_loss_history[current_domain].append(loss_val)
@@ -763,6 +790,25 @@ def run_evolution():
                           f'{phase_str}')
 
                 # PHASE 26: Live State für Dashboard (alle 10 Sekunden)
+                # PHASE 42: Consciousness Glimpse — Logge Salience-Änderungen
+                if hasattr(brain, '_consciousness') and brain._consciousness is not None and int(elapsed) % 30 == 0:
+                    cs = brain._consciousness.get_consciousness_stats()
+                    if cs['broadcast_coherence'] > 0.5:
+                        phase_str += f'| Coher={cs["broadcast_coherence"]:.2f}'
+                    if cs['spotlight_entropy'] > 0.1:
+                        phase_str += f'| Entr={cs["spotlight_entropy"]:.2f}'
+                
+                # PHASE 38: Knowledge Graph — Logge Graph-Wachstum
+                if hasattr(brain, '_knowledge_graph') and brain._knowledge_graph is not None and int(elapsed) % 30 == 0:
+                    kgs = brain._knowledge_graph.get_graph_stats()
+                    if kgs['triples'] > 0:
+                        phase_str += f'| KG={kgs["triples"]}t'
+                
+                # PHASE 43: Auto-Curriculum — Zeige aktuelles Difficulty-Level
+                if hasattr(brain, '_auto_curriculum') and brain._auto_curriculum is not None and int(elapsed) % 30 == 0:
+                    ac = brain._auto_curriculum.get_curriculum_params()
+                    phase_str += f'| Diff={ac["difficulty_name"]}'
+                
                 if int(elapsed) % 10 == 0 and last_log_time != int(elapsed):
                     try:
                         # Per-domain perplexity tracking
@@ -800,6 +846,18 @@ def run_evolution():
                             'active_inference': brain.get_active_inference_report() if hasattr(brain, 'get_active_inference_report') else {},
                             'level_report': info.get('level_report', {}),
                             'reflection': info.get('reflection', {}),
+                            # PHASE 38: Knowledge Graph Stats
+                            'knowledge_graph': brain._knowledge_graph.get_graph_stats() if hasattr(brain, '_knowledge_graph') and brain._knowledge_graph is not None else {},
+                            # PHASE 39: Tool Use Stats
+                            'tool_use': brain._tool_use.get_tool_stats() if hasattr(brain, '_tool_use') and brain._tool_use is not None else {},
+                            # PHASE 40: Multi-Agent Debate Stats
+                            'debate': brain._multi_agent.get_debate_stats() if hasattr(brain, '_multi_agent') and brain._multi_agent is not None else {},
+                            # PHASE 41: Transfer Learning Stats
+                            'transfer': brain._transfer_learning.get_transfer_stats() if hasattr(brain, '_transfer_learning') and brain._transfer_learning is not None else {},
+                            # PHASE 42: Consciousness Glimpse Stats
+                            'consciousness': brain._consciousness.get_consciousness_stats() if hasattr(brain, '_consciousness') and brain._consciousness is not None else {},
+                            # PHASE 43: Auto-Curriculum Stats
+                            'curriculum': brain._auto_curriculum.get_curriculum_stats() if hasattr(brain, '_auto_curriculum') and brain._auto_curriculum is not None else {},
                         }
                         with open('/home/anima/train_state.json', 'w') as sf:
                             json.dump(state, sf)

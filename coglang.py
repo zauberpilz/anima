@@ -1008,15 +1008,28 @@ class EvolutionStrategyOptimizer(CogModule):
     """
     PHASE 13: Gradient-Free Optimizer — Evolution Strategies für Weight Updates.
     Statt Hebbian Learning, nutzt dies perturbationsbasierte Optimierung.
+    
+    Bietet zwei Modi:
+    1. Population-based (original): perturb_weights + apply_perturbations + update_from_fitness
+    2. Inline (NEW): learn_step() — leichte, kontrollierte Perturbation im laufenden Training
     """
     def __init__(self, d_model, population_size=8, sigma=0.01):
         super().__init__()
         self.d_model = d_model
         self.population_size = population_size
-        self.sigma = sigma  # Perturbation noise
+        self.sigma = sigma  # Perturbation noise (0.01 = 1%)
         self._best_weights = {}
         self._best_fitness = float('inf')
         self._max_weight = 1.0  # clamp limit for perturbations
+        
+        # Inline evolution state
+        self.register_buffer('_step', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('_plateau_steps', torch.zeros(1, dtype=torch.long))
+        self._loss_history = []
+        self._saved_weights = {}  # For revert on regression
+        self._perturbed_layer = None
+        self._pre_perturb_loss = None
+        self._last_noise = {}
         
     def perturb_weights(self, model, seed=None):
         """Erstelle perturbierte Kopie der Gewichte."""
@@ -1061,6 +1074,107 @@ class EvolutionStrategyOptimizer(CogModule):
                         update += weights[i] * pert[name]
                 param.data.add_(update, alpha=0.1)
                 param.data.clamp_(-self._max_weight, self._max_weight)
+    
+    def _find_linear_layers(self, modules):
+        """Find all Linear layers in a module list."""
+        if isinstance(modules, nn.Module):
+            return [m for m in modules.modules() if isinstance(m, nn.Linear)]
+        return [m for m in modules if isinstance(m, nn.Linear)]
+    
+    def learn_step(self, current_loss, model_modules):
+        """
+        PHASE 13b: Inline-Evolution-Step.
+        
+        Strategie:
+        - Trackt Loss-Trend über Zeit
+        - Bei Plateau (>200 Steps ohne Verbesserung): gezielte Noise-Injektion
+        - Bei Regression: Revert der letzten Perturbation
+        - Bei Verbesserung: Noise langsam runterfahren (Exploitation)
+        
+        Args:
+            current_loss: float — aktueller Loss-Wert
+            model_modules: nn.ModuleList — Liste aller CogModule (für Weight-Access)
+        """
+        self._step += 1
+        
+        # Loss-History (letzte 500 Werte)
+        self._loss_history.append(current_loss)
+        if len(self._loss_history) > 500:
+            self._loss_history.pop(0)
+        
+        # Check revert condition: if we perturbed and loss regressed
+        if self._pre_perturb_loss is not None and len(self._loss_history) > 10:
+            recent_avg = sum(self._loss_history[-10:]) / 10
+            if recent_avg > self._pre_perturb_loss * 1.05:  # 5% regression
+                # Revert the perturbation (same key format as save)
+                for (m_idx, pn), saved in self._saved_weights.items():
+                    module = model_modules[m_idx]
+                    for param_name, param in module.named_parameters(recurse=True):
+                        if param_name == pn and param.data.shape == saved.shape:
+                            param.data.copy_(saved)
+                            break
+                self._saved_weights = {}
+                self._pre_perturb_loss = None
+                self._perturbed_layer = None
+                self._plateau_steps += 1  # Count regressions
+                return
+        
+        # Plateau detection: every 100 steps
+        if self._step % 100 != 0 or len(self._loss_history) < 100:
+            return
+        
+        # Compare recent 50 steps vs prior 50 steps
+        recent = sum(self._loss_history[-50:]) / 50
+        prior = sum(self._loss_history[-100:-50]) / 50
+        improvement = prior - recent  # positive = improving
+        
+        # Find linear layers to perturb (recursively through all submodules)
+        linear_layers = []
+        for module in model_modules:
+            if isinstance(module, nn.Module):
+                for submodule in module.modules():
+                    if isinstance(submodule, nn.Linear):
+                        linear_layers.append(submodule)
+        
+        if not linear_layers:
+            return
+        
+        if improvement < 0.001:  # Plateau!
+            self._plateau_steps += 1
+            
+            # Escalate noise strength based on plateau duration
+            noise_mult = min(3.0, 1.0 + self._plateau_steps.item() * 0.5)
+            
+            # Pick a random linear layer and perturb it
+            layer = random.choice(linear_layers)
+            
+            # Save current weights for revert
+            self._saved_weights = {}
+            for i, m in enumerate(model_modules):
+                for pn, p in m.named_parameters(recurse=True):
+                    key = (i, pn)
+                    self._saved_weights[key] = p.data.clone()
+            
+            self._pre_perturb_loss = recent
+            self._perturbed_layer = layer
+            
+            # Apply structured noise
+            noise = torch.randn_like(layer.weight.data) * self.sigma * noise_mult
+            # Direction bias: small learned component (random sign per row)
+            noise *= torch.sign(torch.randn(layer.weight.size(0), 1, device=noise.device))
+            layer.weight.data.add_(noise)
+            layer.weight.data.clamp_(-self._max_weight, self._max_weight)
+            
+            # Also perturb bias if present
+            if layer.bias is not None:
+                bias_noise = torch.randn_like(layer.bias.data) * self.sigma * 0.5 * noise_mult
+                layer.bias.data.add_(bias_noise)
+                layer.bias.data.clamp_(-self._max_weight, self._max_weight)
+            
+        else:  # Improving — reduce plateau counter
+            self._plateau_steps = max(0, self._plateau_steps.item() - 1)
+            self._saved_weights = {}
+            self._pre_perturb_loss = None
 
 
 class SkillModule(CogModule):
@@ -1435,6 +1549,11 @@ class CogLang:
                 self.ewc_snapshot_all()
             
             loss = F.cross_entropy(output.view(-1, output.size(-1)), input_ids.view(-1))
+            
+            # PHASE 13b: EvolutionStrategy inline learn_step — Plateau-noise + Revert
+            if self._es is not None and self._ewc_step_counter % 100 == 0:
+                self._es.learn_step(loss.item(), self.modules)
+            
             if torch.isnan(loss) or torch.isinf(loss):
                 return 100.0, info
         return loss.item(), info

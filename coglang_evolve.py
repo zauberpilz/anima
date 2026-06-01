@@ -45,6 +45,43 @@ class CurriculumScheduler:
                 prev = p['domain']
             else:
                 self._domain_order.append('mixed')
+        # PHASE 33: Adaptive Curriculum - Plateau-Erkennung und Phasen-Skipping
+        self._loss_history = []  # Track loss for plateau detection
+        self._current_abs_step = 0  # Absolute step across all phases
+        self._phase_skip_counter = 0  # Wie viele Phasen bereits übersprungen
+        self._blend_weights = {'text': 1.0, 'code': 0.0, 'security': 0.0, 'network': 0.0}  # Running blend
+        self._phase_skipped = set()  # Namen der übersprungenen Phasen
+    
+    def advance_phase(self):
+        """Überspringe die aktuelle Phase (bei Plateau oder Mastery)."""
+        accumulated = 0
+        for i, p in enumerate(self.phases):
+            if p['name'] in self._phase_skipped:
+                continue
+            accumulated += p['steps']
+            current_step = self._current_abs_step
+            if current_step < accumulated:
+                # Überspringe diese Phase
+                self._phase_skipped.add(p['name'])
+                self._phase_skip_counter += 1
+                # Setze Step direkt ans Ende dieser Phase
+                self._current_abs_step = accumulated
+                print(f'[CURRICULUM] Phase "{p["name"]}" übersprungen (Plateau). Nächste Phase: {self.get_phase(self._current_abs_step)["name"]}')
+                return True
+        return False  # Alle Phasen bereits durchlaufen
+        
+    def record_loss(self, loss_val):
+        """PHASE 33: Zeichne Loss auf und prüfe auf Plateau."""
+        self._loss_history.append(loss_val)
+        if len(self._loss_history) > 200:
+            self._loss_history.pop(0)
+        if len(self._loss_history) >= 100:
+            recent = sum(self._loss_history[-50:]) / 50
+            prev = sum(self._loss_history[-100:-50]) / 50
+            if prev > 0 and abs(prev - recent) / prev < 0.005:  # < 0.5% improvement
+                return True  # Plateau detected!
+        return False
+    
 
     def _validate_steps(self, total_steps):
         total = sum(p['steps'] for p in self.phases)
@@ -68,52 +105,62 @@ class CurriculumScheduler:
         During the first `transition_fraction` of a new phase, the previous domain
         is gradually blended out while the new domain is blended in.
         This prevents catastrophic loss spikes at phase boundaries.
+        
+        Nutzt Running-Blend für kontinuierliche, fließende Übergänge.
         """
-        # Default: uniform weights for mixed, single domain for focused phases
+        self._current_abs_step = max(self._current_abs_step, step)
         phase = self.get_phase(step)
         
         if phase['domain'] == 'mixed':
-            return {'text': 0.25, 'code': 0.25, 'security': 0.25, 'network': 0.25}
+            # Sanft in Richtung gleichverteilte Gewichte bewegen
+            target = {'text': 0.25, 'code': 0.25, 'security': 0.25, 'network': 0.25}
+            blend_rate = 0.001  # Langsame Annäherung
+            for d in target:
+                self._blend_weights[d] += blend_rate * (target[d] - self._blend_weights[d])
+            return dict(self._blend_weights)
         
-        # Find where we are in the phase sequence
+        # Finde aktuelle Phase in der Sequenz
         accumulated = 0
-        prev_domain = 'text'  # default fallback
+        prev_domain = 'text'
         for i, p in enumerate(self.phases):
+            if p['name'] in self._phase_skipped:
+                accumulated += p['steps']
+                continue
             phase_start = accumulated
             phase_end = accumulated + p['steps']
             
             if phase_start <= step < phase_end:
-                # We're in phase p
                 domain = p['domain']
                 if domain == 'mixed':
-                    return {'text': 0.25, 'code': 0.25, 'security': 0.25, 'network': 0.25}
-                
-                # Calculate transition progress
-                progress_in_phase = (step - phase_start) / max(1, p['steps'])
-                transition_steps = int(p['steps'] * self.transition_fraction)
-                
-                if progress_in_phase < self.transition_fraction and i > 0:
-                    # Smooth blend: prev domain fades out, new domain fades in
-                    prev_phase = self.phases[i - 1]
-                    prev_domain = prev_phase['domain']
-                    if prev_domain == 'mixed':
-                        # If prev was mixed, distribute evenly
-                        blend = progress_in_phase / self.transition_fraction
-                        return {domain: blend, 'text': (1-blend)/4, 'code': (1-blend)/4,
-                                'security': (1-blend)/4, 'network': (1-blend)/4}
+                    target = {'text': 0.25, 'code': 0.25, 'security': 0.25, 'network': 0.25}
+                else:
+                    progress_in_phase = (step - phase_start) / max(1, p['steps'])
+                    if progress_in_phase < self.transition_fraction and i > 0:
+                        # Finde vorherige Phase (überspringe skipped)
+                        prev_idx = i - 1
+                        while prev_idx >= 0 and self.phases[prev_idx]['name'] in self._phase_skipped:
+                            prev_idx -= 1
+                        if prev_idx >= 0:
+                            prev_phase = self.phases[prev_idx]
+                            prev_domain = prev_phase['domain']
+                            blend = progress_in_phase / self.transition_fraction
+                            target = {d: 0.0 for d in ['text', 'code', 'security', 'network']}
+                            target[prev_domain] = 1.0 - blend
+                            target[domain] = blend
+                        else:
+                            target = {d: 1.0 if d == domain else 0.0 for d in ['text', 'code', 'security', 'network']}
                     else:
-                        blend = progress_in_phase / self.transition_fraction
-                        weights = {d: 0.0 for d in ['text', 'code', 'security', 'network']}
-                        weights[prev_domain] = 1.0 - blend
-                        weights[domain] = blend
-                        return weights
+                        target = {d: 1.0 if d == domain else 0.0 for d in ['text', 'code', 'security', 'network']}
                 
-                # Fully in new domain
-                return {d: 1.0 if d == domain else 0.0 for d in ['text', 'code', 'security', 'network']}
+                # Running Blend: sanfte Annäherung an Ziel
+                blend_rate = 0.01  # 1% pro Schritt
+                for d in target:
+                    self._blend_weights[d] += blend_rate * (target[d] - self._blend_weights[d])
+                return dict(self._blend_weights)
             
             accumulated += p['steps']
         
-        return {'text': 0.25, 'code': 0.25, 'security': 0.25, 'network': 0.25}
+        return dict(self._blend_weights)
 
     def get_domain_for_step(self, step):
         """Return the primary domain name for a given step."""
@@ -627,6 +674,13 @@ def run_evolution():
                 )
 
             history.append(loss_val)
+
+            # PHASE 33: Adaptive Curriculum - Plateau Detection & Phase Skipping
+            if curriculum_enabled and step % 100 == 0 and step > 500:
+                if curriculum.record_loss(loss_val):
+                    advanced = curriculum.advance_phase()
+                    if advanced:
+                        print(f'[CURRICULUM] Plateau bei Step {step}, Loss={loss_val:.4f}')
 
             # Track domain-specific loss
             if current_domain in domain_loss_history:

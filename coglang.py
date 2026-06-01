@@ -243,8 +243,8 @@ class CogModule(nn.Module):
         self._meta_lr_target_error = 0.5
         # PHASE 4: EWC — Elastic Weight Consolidation
         self._ewc_fisher = {}  # Fisher Information Matrix diagonal approximation
-        self._ewc_optimal_params = {}  # Snapshot of important weights
-        self._ewc_lambda = 0.1  # EWC penalty strength
+        self._ewc_optimal_params = {}  # Snapshot of important weights (keyed by tensor id)
+        self._ewc_lambda = 10.0  # EWC penalty strength (erhöht von 0.1 für echten Schutz)
         # PHASE 28: Hebbian rule selector
         self._hebbian_rule = 'oja'  # 'nlms', 'oja', 'bcm'
         
@@ -277,10 +277,11 @@ class CogModule(nn.Module):
                 self._ewc_optimal_params[weight] = weight.data.clone()
                 optimal = self._ewc_optimal_params[weight]
             # Penalty: -lambda * fisher * (current - optimal)
+            # Zieht Gewicht Richtung Optimal, proportional zu Fisher-Importance
             penalty = -self._ewc_lambda * fisher * (weight.data - optimal)
             if torch.isnan(penalty).any() or torch.isinf(penalty).any():
                 return  # Skip EWC wenn penalty NaN
-            weight.data.add_(penalty, alpha=0.01)  # Small step to avoid instability
+            weight.data.add_(penalty)  # alpha=1.0: lambda steuert direkt die Stärke
             
     def _ewc_update_fisher(self, weight, gradient_estimate):
         """PHASE 4: Update Fisher Information diagonal approximation."""
@@ -291,10 +292,10 @@ class CogModule(nn.Module):
             self._ewc_fisher[weight] = 0.9 * self._ewc_fisher[weight] + 0.1 * (gradient_estimate ** 2)
             
     def _ewc_snapshot(self):
-        """PHASE 4: Save current weights as optimal for EWC."""
+        """PHASE 4: Save current weights as optimal for EWC (keyed by tensor identity)."""
         for name, param in self.named_parameters():
             if param.requires_grad or True:  # Track all weights
-                self._ewc_optimal_params[name] = param.data.clone()
+                self._ewc_optimal_params[param] = param.data.clone()  # Key by tensor ref, not name!
             
     def _hebbian(self, error, inp, weight, lr_eff=1.0):
         """PHASE 28: Oja's Rule Hebbian update — weight-normalizing, prevents explosion."""
@@ -779,6 +780,34 @@ class SelfModel(CogModule):
             modulation = self.W_uncertainty(uncertainty_vec)  # [1, 1, d_model]
             return modulation
     
+    def learn_step(self, layer_errors, future_errors=None):
+        """
+        PHASE 6: Lerne, die eigene Unsicherheit besser vorherzusagen.
+        Aktualisiert W_uncertainty mit Hebbian-Regel.
+        
+        layer_errors: Liste von Error-Tensoren pro Layer (aktuelle Schicht)
+        future_errors: Tatsächliche zukünftige Errors (oder None = use current)
+        """
+        with torch.no_grad():
+            # Extrahiere Unsicherheits-Vektor
+            uncertainty_vec = self.layer_error_mean.unsqueeze(0).unsqueeze(0)  # [1, 1, n_layers]
+            
+            # Ziel: Vorhersagefehler der aktuellen Schicht 
+            # (je höher der Fehler, desto mehr Modulation sollte kommen)
+            if future_errors is not None and len(future_errors) > 0:
+                target = sum((e ** 2).mean().item() for e in future_errors) / len(future_errors)
+            else:
+                target = self.layer_error_mean.mean().item()
+            
+            # Hebbian: Modulation verstärken bei hohem Error, abschwächen bei niedrigem
+            lr = 0.001 * target  # LR skaliert mit Error-Größe
+            mod_out = self.W_uncertainty(uncertainty_vec)
+            
+            # Aktualisiere W_uncertainty: verstärke Korrelationen, die Error reduzieren
+            dW = lr * (target - mod_out.mean().item()) * uncertainty_vec.transpose(-1, -2) @ uncertainty_vec
+            self.W_uncertainty.weight.data += dW.squeeze()
+            self.W_uncertainty.weight.data.clamp_(-self._max_weight, self._max_weight)
+    
     def get_confidence(self):
         """Return current self-confidence score."""
         return self.self_confidence.item()
@@ -812,15 +841,31 @@ class PredictiveStack(CogModule):
             # PHASE 11: Hebbian Attention als primäre Attention
             attended = self.hebbian_attn(torch.tanh(e), learn=learn)
             
+            # PHASE 3: Predictive Attention - Error-modulierter Fokus (zusätzlich zu Hebbian)
+            pred_attended = self.attention(current, e, learn=learn)
+            if learn:
+                # Learn: attention output soll Error minimieren helfen
+                self.attention.learn_step(current, e, pred_attended, current)
+            # Kombiniere beide Attention-Arten
+            attended = attended + pred_attended * 0.3
+            
+            # PHASE 11: Hebbian Attention learn_step aktivieren (Ziel: Error reduzieren)
+            if learn:
+                # Nutze attn_input als x, attended als output, current als target
+                # Attention soll lernen, Error-Signal in nützliche Repräsentation zu wandeln
+                self.hebbian_attn.learn_step(current, attended, current)
+            
             # PHASE 29: Residual connection — add input to attended output
             attended = current + attended * 0.5  # Scaled residual
             
-            # PHASE 6: Self-Model modulation
-            if len(errors) == self.n_layers:
-                modulation = self.self_model(errors)
-                current = attended + modulation * 0.1
-            else:
-                current = attended
+            # PHASE 6: Self-Model modulation auf JEDER Schicht (skaliert mit Tiefe)
+            modulation = self.self_model(errors[:i+1])
+            depth_scale = (i + 1) / self.n_layers  # Mehr Modulation in tieferen Schichten
+            current = attended + modulation * 0.1 * depth_scale
+            
+            # Lerne SelfModel auf jeder Schicht
+            if learn:
+                self.self_model.learn_step(errors[:i+1], errors)
         return errors, states, preds
 
     def mixed_prediction(self, predictions):
@@ -1340,6 +1385,15 @@ class CogLang:
             # Write to episodic memory
             if self._memory is not None:
                 self._memory._write_to_memory(info['sparse'][:, -1, :])
+                # PHASE 1: Auch EpisodicMemory learn_step aktivieren
+                query = info['sparse'][:, -1:, :]
+                retrieved = self._memory(query)
+                self._memory.learn_step(query, retrieved, info['sparse'])
+            
+            # PHASE 8: NeuroSymbolicBridge learn_step aktivieren
+            if self._bridge is not None:
+                total_error = sum((e ** 2).mean(dim=-1, keepdim=True) for e in info['errors']) / len(info['errors'])
+                self._bridge.learn_step(info['sparse'], total_error)
             
             # PHASE 7: Intrinsic Motivation - compute curiosity reward
             if self._motivation is not None:
@@ -1351,10 +1405,23 @@ class CogLang:
                         module._meta_lr_scale *= curiosity_factor
                         module._meta_lr_scale = max(0.1, min(2.0, module._meta_lr_scale))
             
+            # PHASE 4: EWC Snapshot - alle 1000 Schritte Gewichte als Optimal sichern
+            if not hasattr(self, '_ewc_step_counter'):
+                self._ewc_step_counter = 0
+            self._ewc_step_counter += 1
+            if self._ewc_step_counter % 1000 == 0:
+                self.ewc_snapshot_all()
+            
             loss = F.cross_entropy(output.view(-1, output.size(-1)), input_ids.view(-1))
             if torch.isnan(loss) or torch.isinf(loss):
                 return 100.0, info
         return loss.item(), info
+    
+    def ewc_snapshot_all(self):
+        """PHASE 4: EWC on all CogModule instances - schützt vor Catastrophic Forgetting."""
+        for module in self.modules.modules():
+            if hasattr(module, '_ewc_snapshot') and module is not self:
+                module._ewc_snapshot()
 
     def parameter_count(self):
         return sum(p.numel() for p in self.modules.parameters())

@@ -3538,6 +3538,237 @@ class ConsciousnessGlimpse(CogModule):
         }
 
 
+class AutoCurriculum(CogModule):
+    """
+    PHASE 43: Auto-Curriculum — Automatische Schwierigkeitsanpassung.
+    
+    CogLang passt die Trainingsschwierigkeit automatisch an sein
+    aktuelles Leistungsniveau an (Zone of Proximal Development).
+    
+    Kernmechanismen:
+    1. Mastery-Tracking: Gleitender Durchschnitt des Loss über Fenster
+    2. ZPD-Algorithmus: Schwierigkeit so wählen, dass ~70% Erfolg
+    3. Difficulty-Dimensionen: Sequenzlänge, Noise-Level, Task-Komplexität
+    4. Curriculum-Verlauf: Dokumentiere Fortschritt über Zeit
+    
+    Das Modul gibt Empfehlungen an die Trainingsschleife zurück.
+    """
+    def __init__(self, d_model, n_difficulty_levels=5, window_size=100):
+        super().__init__()
+        self.d_model = d_model
+        self.n_difficulty_levels = n_difficulty_levels
+        self.window_size = window_size
+        
+        # ——— Difficulty-Definitionen ———
+        self.difficulty_configs = [
+            {'seq_len': 8, 'noise': 0.0, 'name': 'trivial'},
+            {'seq_len': 16, 'noise': 0.05, 'name': 'easy'},
+            {'seq_len': 32, 'noise': 0.1, 'name': 'medium'},
+            {'seq_len': 64, 'noise': 0.15, 'name': 'hard'},
+            {'seq_len': 128, 'noise': 0.2, 'name': 'expert'},
+        ]
+        
+        # ——— Performance-Puffer ———
+        self.register_buffer('loss_buffer', torch.zeros(n_difficulty_levels, window_size))
+        self.register_buffer('loss_counts', torch.zeros(n_difficulty_levels, dtype=torch.long))
+        self.register_buffer('mastery_scores', torch.ones(n_difficulty_levels) * 0.5)
+        
+        # ——— ZPD-State ———
+        self.register_buffer('current_difficulty', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('target_mastery', torch.tensor([0.7]))  # 70% Ziel
+        self.register_buffer('adaptation_rate', torch.tensor([0.05]))
+        
+        # ——— Curriculum-Verlauf ———
+        self.register_buffer('difficulty_history', torch.zeros(5000, dtype=torch.long))
+        self.register_buffer('mastery_history', torch.zeros(5000))
+        self._history_idx = 0
+        
+        # ——— Difficulty Embedding (für Conditioning) ———
+        self.difficulty_embedding = nn.Embedding(n_difficulty_levels, d_model)
+        
+        # ——— Task-Scoring ———
+        self.task_scorer = nn.Linear(d_model, n_difficulty_levels)
+        
+        # ——— Metrik ———
+        self.register_buffer('curriculum_progress', torch.zeros(n_difficulty_levels))
+        self._steps_at_current = 0
+    
+    def record_loss(self, loss, difficulty=None):
+        """
+        Zeichne Loss für aktuelle Schwierigkeit auf.
+        
+        Args:
+            loss: float — aktueller Loss
+            difficulty: int oder None (None = aktuelle)
+        """
+        with torch.no_grad():
+            d = difficulty if difficulty is not None else self.current_difficulty.item()
+            d = min(d, self.n_difficulty_levels - 1)
+            
+            idx = self.loss_counts[d].item() % self.window_size
+            self.loss_buffer[d, idx] = loss
+            self.loss_counts[d] += 1
+    
+    def compute_mastery(self, difficulty=None):
+        """
+        Berechne Mastery-Score für eine Schwierigkeitsstufe.
+        
+        Mastery = 1 / (1 + avg_loss / baseline)
+        
+        Args:
+            difficulty: int oder None
+        
+        Returns:
+            mastery: float (0-1)
+        """
+        with torch.no_grad():
+            d = difficulty if difficulty is not None else self.current_difficulty.item()
+            d = min(d, self.n_difficulty_levels - 1)
+            
+            n = min(self.loss_counts[d].item(), self.window_size)
+            if n < 10:  # Nicht genug Daten
+                return 0.5
+            
+            # Durchschnittlicher Loss im Fenster
+            recent = self.loss_buffer[d, :n]
+            avg_loss = recent.mean().item()
+            
+            # Baseline: Loss auf Stufe 0 (trivial)
+            n0 = min(self.loss_counts[0].item(), self.window_size)
+            baseline = self.loss_buffer[0, :max(1, n0)].mean().item() if n0 > 0 else avg_loss
+            
+            # Mastery: je niedriger Loss im Vergleich zu Baseline, desto besser
+            if baseline < 0.1:
+                mastery = 0.8  # Default wenn Baseline ~0
+            else:
+                ratio = avg_loss / max(0.1, baseline)
+                mastery = 1.0 / (1.0 + ratio)
+            
+            # Glätten mit vorherigem Wert
+            old = self.mastery_scores[d].item()
+            smoothed = old * 0.9 + mastery * 0.1
+            self.mastery_scores[d] = smoothed
+            
+            return smoothed
+    
+    def adapt_difficulty(self):
+        """
+        Passe Schwierigkeit basierend auf Mastery an (ZPD).
+        
+        Returns:
+            new_difficulty: int
+            changed: bool
+        """
+        with torch.no_grad():
+            current = self.current_difficulty.item()
+            mastery = self.compute_mastery(current)
+            
+            target = self.target_mastery.item()
+            changed = False
+            
+            if mastery > target + 0.1 and current < self.n_difficulty_levels - 1:
+                # Zu einfach: erhöhe Schwierigkeit
+                new_d = current + 1
+                changed = True
+            elif mastery < target - 0.2 and current > 0:
+                # Zu schwer: verringere Schwierigkeit
+                new_d = current - 1
+                changed = True
+            else:
+                new_d = current
+            
+            if changed:
+                self.current_difficulty[0] = new_d
+                self.curriculum_progress[current] = 1.0
+                self._steps_at_current = 0
+                
+                # Dokumentiere im Verlauf
+                idx = self._history_idx % 5000
+                self.difficulty_history[idx] = new_d
+                self.mastery_history[idx] = mastery
+                self._history_idx += 1
+            else:
+                self._steps_at_current += 1
+            
+            return new_d, changed
+    
+    def get_curriculum_params(self):
+        """
+        Gib aktuelle Curriculum-Parameter zurück.
+        
+        Returns:
+            dict mit seq_len, noise, difficulty, etc.
+        """
+        d = self.current_difficulty.item()
+        config = self.difficulty_configs[min(d, self.n_difficulty_levels - 1)]
+        return {
+            'difficulty_level': d,
+            'difficulty_name': config['name'],
+            'seq_len': config['seq_len'],
+            'noise': config['noise'],
+            'mastery': self.mastery_scores[d].item(),
+            'steps_at_current': self._steps_at_current,
+        }
+    
+    def condition(self, hidden_states):
+        """
+        Moduliere Hidden-States mit Difficulty-Embedding.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+        
+        Returns:
+            conditioned: [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            d_id = min(self.current_difficulty.item(), self.n_difficulty_levels - 1)
+            diff_emb = self.difficulty_embedding(
+                torch.tensor([d_id], device=hidden_states.device)
+            )  # [1, d]
+            diff_exp = diff_emb.unsqueeze(1).expand(batch, seq, -1)
+            return hidden_states + diff_exp * 0.1
+    
+    def learn_step(self, loss):
+        """
+        Lerne aus aktuellem Schritt: Mastery + ggf. Difficulty-Anpassung.
+        
+        Args:
+            loss: float
+        """
+        with torch.no_grad():
+            self.record_loss(loss)
+            
+            # Passe Schwierigkeit alle N Steps an
+            if self._steps_at_current > 0 and self._steps_at_current % 200 == 0:
+                new_d, changed = self.adapt_difficulty()
+                if changed:
+                    return {'difficulty_changed': True, 'new_difficulty': new_d}
+            
+            return {'difficulty_changed': False}
+    
+    def get_curriculum_stats(self):
+        """Gib Curriculum-Statistiken zurück."""
+        stats = {
+            'current_difficulty': self.current_difficulty.item(),
+            'config': self.difficulty_configs[min(
+                self.current_difficulty.item(), self.n_difficulty_levels - 1
+            )],
+            'masteries': {},
+            'n_adaptations': min(self._history_idx, 5000),
+        }
+        for i in range(self.n_difficulty_levels):
+            name = self.difficulty_configs[i]['name']
+            n = min(self.loss_counts[i].item(), self.window_size)
+            avg_loss = self.loss_buffer[i, :n].mean().item() if n > 0 else 0
+            stats['masteries'][name] = {
+                'score': self.mastery_scores[i].item(),
+                'avg_loss': avg_loss,
+                'n_samples': self.loss_counts[i].item(),
+            }
+        return stats
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -3561,6 +3792,7 @@ class CogLang:
         self._multi_agent = None
         self._transfer_learning = None
         self._consciousness = None
+        self._auto_curriculum = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -3637,6 +3869,10 @@ class CogLang:
     def ConsciousnessGlimpse(self, d_model, spotlight_size=1, n_glimpses=3):
         """PHASE 42: Consciousness Glimpse — Global Workspace Broadcasting."""
         m = ConsciousnessGlimpse(d_model, spotlight_size, n_glimpses); self.modules.append(m); self._consciousness = m; return m
+    
+    def AutoCurriculum(self, d_model, n_difficulty_levels=5, window_size=100):
+        """PHASE 43: Auto-Curriculum — Automatische Schwierigkeitsanpassung."""
+        m = AutoCurriculum(d_model, n_difficulty_levels, window_size); self.modules.append(m); self._auto_curriculum = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -3791,6 +4027,11 @@ class CogLang:
                 pred = self._transfer_learning.condition(pred, learn_domain)
                 info_extra['domain']['learn_domain'] = learn_domain
         
+        # PHASE 43: Auto-Curriculum — Difficulty Conditioning
+        if self._auto_curriculum is not None:
+            pred = self._auto_curriculum.condition(pred)
+            info_extra['curriculum'] = self._auto_curriculum.get_curriculum_params()
+        
         output, hidden = self._decoder(pred)
         
         # PHASE 8: Apply neuro-symbolic rules to output
@@ -3925,6 +4166,12 @@ class CogLang:
                 self._transfer_learning.learn_step(info['sparse'], domain_id, loss.item())
                 # Speichere Input/Target für Few-Shot
                 self._transfer_learning.fewshot_store(input_ids[0], input_ids[0], domain_id)
+            
+            # PHASE 43: Auto-Curriculum learn_step — Schwierigkeit anpassen
+            if self._auto_curriculum is not None:
+                curriculum_result = self._auto_curriculum.learn_step(loss.item())
+                if curriculum_result.get('difficulty_changed'):
+                    info_extra['curriculum_change'] = curriculum_result
             
             # PHASE 13b: EvolutionStrategy inline learn_step — Plateau-noise + Revert
             if self._es is not None and self._ewc_step_counter % 100 == 0:
@@ -4186,6 +4433,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.MultiAgent(d_model=d_sparse, n_personas=2)
     brain.TransferLearning(d_model=d_sparse, max_domains=8, adapter_rank=8)
     brain.ConsciousnessGlimpse(d_model=d_sparse, spotlight_size=1, n_glimpses=3)
+    brain.AutoCurriculum(d_model=d_sparse, n_difficulty_levels=5, window_size=100)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

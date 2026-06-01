@@ -2007,6 +2007,85 @@ class NetworkEncoder(CogModule):
             }
 
 
+class GoalEncoder(CogModule):
+    """
+    PHASE 36: Goal-Directed Generation — Zielgesteuerte Textproduktion.
+    
+    Erlaubt CogLang, zielgerichtet zu generieren statt nur next-token.
+    Das Goal wird als Embedding kodiert und moduliert alle Hidden-States.
+    
+    Drei Mechanismen:
+    1. Goal Encoding: Ziel-Text → d_model-Vektor
+    2. Goal Conditioning: Gate-gesteuerte Modulation der Hidden-States
+    3. Goal Evaluation: Selbstbewertung ob Output das Ziel erfüllt
+    """
+    def __init__(self, d_model, max_goal_len=50):
+        super().__init__()
+        self.d_model = d_model
+        self.max_goal_len = max_goal_len
+        
+        # Goal Encoder: projiziert gemittelte Goal-Embeddings
+        self.goal_proj = nn.Linear(d_model, d_model, bias=False)
+        
+        # Goal Gate: [state; goal] → Gating-Signal
+        self.goal_gate = nn.Linear(d_model * 2, d_model)
+        
+        # Goal Evaluator: Erfüllungsgrad bewerten
+        self.evaluator = nn.Linear(d_model, 1, bias=False)
+        
+        # Goal Speicher (für Metrik-Tracking)
+        self.register_buffer('goal_trace', torch.zeros(100, d_model))
+        self.register_buffer('goal_success', torch.zeros(100))
+        self._goal_idx = 0
+        self._max_weight = 1.0
+        
+    def encode(self, goal_token_ids, sensory_module):
+        """Wandle Goal-Tokens in d_model-Embedding."""
+        with torch.no_grad():
+            if goal_token_ids.dim() == 1:
+                goal_token_ids = goal_token_ids.unsqueeze(0)
+            # Embed via SensoryInput
+            goal_emb = sensory_module(goal_token_ids)  # [batch, seq, d_model]
+            # Mean pool
+            goal_pooled = goal_emb.mean(dim=1, keepdim=True)
+            # Projiziere in Goal-Space
+            return self.goal_proj(goal_pooled)
+    
+    def condition(self, hidden, goal_emb):
+        """Moduliere Hidden-States mit Goal via Gate."""
+        with torch.no_grad():
+            batch, seq, d = hidden.shape
+            goal_exp = goal_emb.expand(-1, seq, -1)
+            gate_in = torch.cat([hidden, goal_exp], dim=-1)
+            gate = torch.sigmoid(self.goal_gate(gate_in))
+            return hidden + gate * goal_exp * 0.3
+    
+    def evaluate(self, gen_emb, goal_emb):
+        """Bewerte Erfüllungsgrad: 0=schlecht, 1=perfekt."""
+        with torch.no_grad():
+            gen_n = gen_emb / (gen_emb.norm(dim=-1, keepdim=True) + 1e-8)
+            goal_n = goal_emb / (goal_emb.norm(dim=-1, keepdim=True) + 1e-8)
+            similarity = (gen_n * goal_n).sum(dim=-1, keepdim=True)
+            sim_score = similarity * 0.5 + 0.5  # [-1,1] → [0,1]
+            learned = torch.sigmoid(self.evaluator(gen_emb - goal_emb))
+            return 0.7 * sim_score + 0.3 * learned
+    
+    def learn_step(self, goal_emb, gen_emb, target):
+        """Lerne, Goals besser zu evaluieren."""
+        with torch.no_grad():
+            combined = gen_emb - goal_emb
+            current = torch.sigmoid(self.evaluator(combined))
+            error = target - current
+            dw = (error.T @ combined) / combined.size(0)
+            self.evaluator.weight.data.add_(dw, alpha=self._lr * 0.01)
+            self.evaluator.weight.data.clamp_(-self._max_weight, self._max_weight)
+            # Speichere
+            idx = self._goal_idx % 100
+            self.goal_trace[idx] = goal_emb.squeeze()
+            self.goal_success[idx] = target.mean().item()
+            self._goal_idx += 1
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -2023,6 +2102,7 @@ class CogLang:
         self._security_head = None
         self._network_encoder = None
         self._sleep_replay = None
+        self._goal_encoder = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -2071,6 +2151,10 @@ class CogLang:
     
     def SleepReplay(self, buffer_size=10000, d_model=None):
         m = SleepReplay(buffer_size, d_model); self.modules.append(m); self._sleep_replay = m; return m
+
+    def GoalEncoder(self, d_model, max_goal_len=50):
+        """PHASE 36: Goal-Directed Generation."""
+        m = GoalEncoder(d_model, max_goal_len); self.modules.append(m); self._goal_encoder = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -2346,6 +2430,127 @@ class CogLang:
         
         return ctx
 
+    def generate_goal_directed(self, prompt_ids, goal_token_ids, max_new=100, 
+                                 temperature=0.7, top_k=40, n_candidates=5):
+        """
+        PHASE 36: Goal-Directed Generation.
+        
+        Generiert nicht einfach next-token, sondern versucht, ein gegebenes Goal
+        zu erfüllen. Nutzt Beam-Search-ähnliche Mehrfachgeneration + Evaluation.
+        
+        Args:
+            prompt_ids: [seq] Start-Prompt
+            goal_token_ids: [goal_seq] Goal-Beschreibung
+            max_new: Maximal zu generierende Tokens
+            temperature: Sampling-Temperatur
+            top_k: Top-K Sampling
+            n_candidates: Anzahl paralleler Kandidaten (Beam Search Breite)
+        
+        Returns:
+            best_ids: [seq + max_new] Beste Goal-erfüllende Sequenz
+            scores: dict mit Metriken
+        """
+        device = next(self.modules.parameters()).device
+        prompt_ids = prompt_ids.to(device)
+        goal_token_ids = goal_token_ids.to(device)
+        
+        if self._goal_encoder is None:
+            # Fallback: normale Generation wenn GoalEncoder fehlt
+            return self.generate_safe(prompt_ids, max_new, temperature, top_k), {}
+        
+        with torch.no_grad():
+            # ——— 1. Encode Goal ———
+            if self._sensory is not None:
+                goal_emb = self._goal_encoder.encode(goal_token_ids, self._sensory)
+            else:
+                goal_emb = torch.zeros(1, 1, self._goal_encoder.d_model, device=device)
+            
+            # ——— 2. Multi-Candidate Generation ———
+            candidates = []
+            scores = []
+            
+            for c in range(n_candidates):
+                ctx = prompt_ids.clone()
+                if ctx.dim() == 1:
+                    ctx = ctx.unsqueeze(0)
+                
+                for step in range(max_new):
+                    temp = max(0.1, min(2.0, temperature * (1.0 + step / max_new * 0.3)))
+                    
+                    out, info = self.forward(ctx[:, -256:], learn=False)
+                    logits = out[:, -1, :] / temp
+                    
+                    # NaN-Guard
+                    logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
+                    
+                    # PHASE 36: Goal-Conditioned Sampling
+                    # Moduliere Logits mit Goal-Fulfillment
+                    if self._goal_encoder is not None and step > max_new // 4:
+                        # Nach 25% der Generation: bevorzuge Goal-konsistente Tokens
+                        # (Goal-Bias steigt mit der Zeit)
+                        goal_bias = min(0.5, step / max_new * 0.8)
+                        
+                        # Simuliere: probiere Top-5 Tokens und bewerte mit Goal
+                        k_candidates = min(top_k, logits.size(-1))
+                        top_val, top_idx = torch.topk(logits, k_candidates)
+                        
+                        for try_k in range(min(5, k_candidates)):
+                            test_token = top_idx[:, try_k:try_k+1]
+                            test_ctx = torch.cat([ctx, test_token], dim=-1)
+                            test_out, test_info = self.forward(test_ctx[:, -128:], learn=False)
+                            test_emb = test_info.get('sparse', test_out).mean(dim=1)
+                            test_score = self._goal_encoder.evaluate(test_emb, goal_emb)
+                            # Boost logits für Goal-konsistente Tokens
+                            logits[0, top_idx[0, try_k]] += test_score.item() * goal_bias * 2.0
+                    
+                    # Top-K Sampling
+                    k = min(top_k, logits.size(-1))
+                    top_k_logits, top_k_indices = torch.topk(logits, k)
+                    top_k_logits = top_k_logits - top_k_logits.max(dim=-1, keepdim=True)[0]
+                    probs = F.softmax(top_k_logits, dim=-1)
+                    probs = torch.nan_to_num(probs, nan=0.0)
+                    
+                    if probs.sum() < 1e-8:
+                        probs = torch.ones_like(probs) / probs.size(-1)
+                    
+                    try:
+                        next_token = torch.multinomial(probs, 1)
+                        next_token = top_k_indices.gather(1, next_token)
+                    except RuntimeError:
+                        next_token = torch.randint(0, logits.size(-1), (1, 1), device=device)
+                    
+                    ctx = torch.cat([ctx, next_token], dim=-1)
+                    if ctx.size(-1) > 1024:
+                        ctx = ctx[:, -512:]
+                
+                # ——— 3. Evaluate Candidate ———
+                # Bewerte wie gut der Kandidat das Goal erfüllt
+                final_out, final_info = self.forward(ctx[:, -256:], learn=False)
+                final_emb = final_info.get('sparse', final_out).mean(dim=1)
+                goal_score = self._goal_encoder.evaluate(final_emb, goal_emb)
+                
+                # Diversitäts-Bonus: bestrafe Ähnlichkeit zu bestehenden Kandidaten
+                diversity_bonus = 0.0
+                for prev_ctx, _ in candidates:
+                    overlap = (ctx[0] == prev_ctx[0]).float().mean().item()
+                    diversity_bonus += overlap * 0.1  # Strafe für Ähnlichkeit
+                
+                final_score = goal_score.item() - diversity_bonus / max(1, len(candidates))
+                
+                candidates.append((ctx, final_score))
+                scores.append(final_score)
+            
+            # ——— 4. Besten Kandidaten auswählen ———
+            best_idx = max(range(len(candidates)), key=lambda i: candidates[i][1])
+            best_ctx, best_score = candidates[best_idx]
+            
+            return best_ctx.squeeze(0) if best_ctx.size(0) == 1 else best_ctx, {
+                'goal_score': best_score,
+                'all_scores': scores,
+                'n_candidates': n_candidates,
+                'goal_fulfillment': max(0, min(1, best_score)),
+            }
+
 
 def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4, n_rules=16, es_population=8, n_skills=8, use_mixed_precision=True, hierarchical_pc=False, hp_n_levels=3, hp_layers_per_level=None):
     """Anima in CogLang v3 — Vollständige AGI Architecture mit allen Phasen + Efficiency.
@@ -2379,6 +2584,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.NeuroSymbolicBridge(vocab_size=vocab_size, d_model=d_sparse, n_rules=n_rules)
     brain.EvolutionStrategy(d_model=d_sparse, population_size=es_population, sigma=0.01)
     brain.SkillModule(d_model=d_sparse, n_skills=n_skills)
+    brain.GoalEncoder(d_model=d_sparse, max_goal_len=50)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

@@ -419,19 +419,31 @@ class EpisodicMemory(CogModule):
         self.memory_age += 1
         self.memory_strength = torch.clamp(self.memory_strength - 0.01, 0.1, 1.0)
         
-    def learn_step(self, query, retrieved, target):
+    def learn_step(self, query, retrieved_proj, target):
         """Hebbian learning for memory read/write weights."""
-        # Learn to retrieve better: minimize difference between retrieved and target
-        error = target - retrieved  # [batch, seq, d]
-        
-        # Update W_read
-        e_flat = error.reshape(-1, self.d_model)
+        # Recompute full retrieval (UNPROJECTED) for error in d_model space
+        # retrieved_proj has target_dim (256), but target has d_model (1812)
         q_flat = query.reshape(-1, self.d_model)
-        sim = q_flat @ self.memory.T  # [batch*seq, memory_size]
-        att = torch.softmax(sim / (self.d_model ** 0.5), dim=-1)
+        sim = q_flat @ self.memory.T  # [batch, memory_size]
+        att = torch.softmax(sim / (self.d_model ** 0.5), dim=-1)  # [batch, memory_size]
+        retrieved_full = att @ self.memory  # [batch, d_model=1812]
+        retrieved_full = retrieved_full.reshape(query.shape)  # [batch, 1, d_model]
         
-        # dW_read = error^T @ attention
-        dw_read = e_flat.T @ att  # [d, memory_size]
+        # Error am QUERY-Position (letztes Token), nicht am ganzen Sequence!
+        # query ist [batch, 1, d_model], target ist [batch, seq, d_model]
+        error = target[:, -1:, :] - retrieved_full  # [batch, 1, d_model]
+        e_flat = error.reshape(-1, self.d_model)  # [batch, d_model]
+        
+        # Update W_proj: learn to project d_model -> target_dim accurately
+        current_proj = self.W_proj(query)  # [batch, 1, target_dim]
+        proj_error = retrieved_proj - current_proj
+        p_flat = proj_error.reshape(-1, self.target_dim)  # [batch, target_dim]
+        dw_proj = p_flat.T @ q_flat  # [target_dim, d_model]
+        self.W_proj.weight.data.add_(dw_proj, alpha=self._lr * 0.01)
+        self.W_proj.weight.data.clamp_(-self._max_weight, self._max_weight)
+        
+        # dW_read = error^T @ attention  (beide auf batch-Dimension, passt!)
+        dw_read = e_flat.T @ att  # [d_model, batch] @ [batch, memory_size] = [d_model, memory_size]
         if self.W_read.weight not in self._momentum:
             self._momentum[self.W_read.weight] = dw_read.T.clone()
         else:
@@ -801,11 +813,16 @@ class SelfModel(CogModule):
             
             # Hebbian: Modulation verstärken bei hohem Error, abschwächen bei niedrigem
             lr = 0.001 * target  # LR skaliert mit Error-Größe
-            mod_out = self.W_uncertainty(uncertainty_vec)
+            mod_out = self.W_uncertainty(uncertainty_vec)  # [1, 1, d_model]
             
-            # Aktualisiere W_uncertainty: verstärke Korrelationen, die Error reduzieren
-            dW = lr * (target - mod_out.mean().item()) * uncertainty_vec.transpose(-1, -2) @ uncertainty_vec
-            self.W_uncertainty.weight.data += dW.squeeze()
+            # Aktualisiere W_uncertainty: korrekte Hebbian-Regel (outer product)
+            # dW = lr * (error_in_output) x (input_activation)
+            # error_in_output: target - mod_out, shape [1, 1, d_model]
+            # input_activation: uncertainty_vec, shape [1, 1, n_layers]
+            # dW shape: [1, d_model, n_layers] -> squeeze(0) -> [d_model, n_layers]
+            mod_error = target - mod_out  # [1, 1, d_model]
+            dW = lr * mod_error.transpose(-1, -2) @ uncertainty_vec  # [1, d_model, 1] @ [1, 1, n_layers] = [1, d_model, n_layers]
+            self.W_uncertainty.weight.data += dW.squeeze(0)
             self.W_uncertainty.weight.data.clamp_(-self._max_weight, self._max_weight)
     
     def get_confidence(self):
@@ -1483,15 +1500,17 @@ class CogLang:
         # NaN-Guard: Sichere Predictions
         predictions = [torch.nan_to_num(p, nan=0.0, posinf=1.0, neginf=-1.0) for p in predictions]
         pred = self._stack.mixed_prediction(predictions)
+        
+        # PHASE 14: SkillModule transformation - modulates hidden state BEFORE decoder
+        # SkillModule arbeitet auf d_sparse-Dimension (pred), nicht auf vocab-Logits
+        if self._skills is not None:
+            pred = self._skills(pred, context=sparse_x)
+        
         output, hidden = self._decoder(pred)
         
         # PHASE 8: Apply neuro-symbolic rules to output
         if self._bridge is not None:
             output = self._bridge(output, context_embedding=sparse_x)
-        
-        # PHASE 14: SkillModule transformation - modulates output with skill-specific transforms
-        if self._skills is not None:
-            output = self._skills(output, context=sparse_x)
             
         return output, {'errors': errors, 'predictions': predictions, 'hidden': hidden, 'pred': pred, 'sparse': sparse_x, 'output': output}
 
@@ -1575,10 +1594,14 @@ class CogLang:
         torch.save(checkpoint, path)
         print(f'Checkpoint gespeichert: {path}')
 
-    def load_checkpoint(self, path):
+    def load_checkpoint(self, path, strict=True):
         if os.path.exists(path):
             checkpoint = torch.load(path, map_location='cpu')
-            self.modules.load_state_dict(checkpoint['model_state'])
+            result = self.modules.load_state_dict(checkpoint['model_state'], strict=False)
+            if result.missing_keys:
+                print(f'  Neue Keys (aus Checkpoint): {result.missing_keys}')
+            if result.unexpected_keys:
+                print(f'  Übersprungene Keys (nicht im Checkpoint): {result.unexpected_keys}')
             print(f'Checkpoint geladen: {path}')
             return checkpoint.get('config')
         return None

@@ -860,6 +860,8 @@ def run_evolution():
                             'curriculum': brain._auto_curriculum.get_curriculum_stats() if hasattr(brain, '_auto_curriculum') and brain._auto_curriculum is not None else {},
                             # PHASE 44: Causal Reasoning Stats
                             'causal': brain._causal_reasoning.get_causal_stats() if hasattr(brain, '_causal_reasoning') and brain._causal_reasoning is not None else {},
+                            # PHASE 45: System-2 Reasoning Stats
+                            'reasoning': brain._system2_reasoning.get_reasoning_stats() if hasattr(brain, '_system2_reasoning') and brain._system2_reasoning is not None else {},
                         }
                         with open('/home/anima/train_state.json', 'w') as sf:
                             json.dump(state, sf)

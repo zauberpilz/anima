@@ -3501,7 +3501,7 @@ class ConsciousnessGlimpse(CogModule):
                 'spotlight_indices': indices,
                 'spotlight_weights': weights,
                 'broadcast_coherence': coherence,
-                'spotlight_entropy': self.spotlight_entropy[max(0, self._entropy_idx-1)].item(),
+                'spotlight_entropy': self.spotlight_entropy[(self._entropy_idx - 1) % 100].item(),
                 'n_glimpses': self.glimpse_count.item(),
             }
     
@@ -4002,6 +4002,251 @@ class CausalReasoning(CogModule):
         }
 
 
+class System2Reasoning(CogModule):
+    """
+    PHASE 45: System-2 Reasoning — Kettenbewusstsein + Verifikation + Gedankenbäume.
+    
+    CogLang bekommt die Fähigkeit, NICHT nur einen Schritt vorherzusagen,
+    sondern MEHRERE Reasoning-Schritte zu generieren, zu VERIFIZIEREN
+    und den BESTEN Pfad zu wählen (dual-process theory: Kahneman).
+    
+    Kernkomponenten:
+    1. Chain-of-Thought Decoder: Generiert schrittweise Reasoning-Ketten
+       - Nimmt aktuellen Hidden-State → generiert N Reasoning-Schritte
+       - Jeder Schritt ist [batch, d_model] — abstrakter Gedanke
+    2. Verification Head: Bewertet jeden Schritt auf Korrektheit
+       - Lernt: "macht dieser Schritt Sinn?"
+       - Scoring: [0, 1] — 1 = korrekt, 0 = inkorrekt
+    3. Tree-of-Thought: Parallel-Exploration mehrerer Pfade
+       - Verzweige an jedem Schritt in K Alternativen
+       - Wähle den Pfad mit höchstem Verifikations-Score
+    
+    Integration mit ConsciousnessGlimpse:
+    - System-2 operiert auf Spotlight-Inhalten (bewusste Gedanken)
+    - Verifikations-Scores fließen in Salience-Berechnung ein
+    """
+    def __init__(self, d_model, n_reasoning_steps=8, n_tree_branches=3, temperature=0.3):
+        super().__init__()
+        self.d_model = d_model
+        self.n_reasoning_steps = n_reasoning_steps
+        self.n_tree_branches = n_tree_branches
+        self.temperature = temperature
+        
+        # ——— 1. Chain-of-Thought Decoder ———
+        # Transformiert aktuellen Gedanken in nächsten Reasoning-Schritt
+        self.cot_decoder = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, d_model),
+        )
+        
+        # ——— 2. Verification Head ———
+        # Bewertet einen Reasoning-Schritt: "ist das korrekt/widerspruchsfrei?"
+        self.verification_net = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1),
+        )
+        
+        # ——— 3. Tree-of-Thought Router ———
+        # Erzeugt K alternative Fortsetzungen eines Reasoning-Schritts
+        self.tree_router = nn.Linear(d_model, n_tree_branches * d_model)
+        
+        # ——— 4. Schritt-Embedding ———
+        # Position im Reasoning-Prozess
+        self.step_embedding = nn.Embedding(n_reasoning_steps + 1, d_model)
+        
+        # ——— 5. Metrik-Tracking ———
+        self.register_buffer('verification_history', torch.zeros(500))
+        self.register_buffer('tree_depth_history', torch.zeros(500))
+        self.register_buffer('reasoning_quality', torch.zeros(100))
+        self._metric_idx = 0
+        self._quality_idx = 0
+    
+    def generate_reasoning_chain(self, hidden_state):
+        """
+        Generiere eine Kette von Reasoning-Schritten (Chain-of-Thought).
+        
+        Args:
+            hidden_state: [batch, d_model] — Aktueller Gedanke
+        
+        Returns:
+            chain: [batch, n_steps, d_model] — Reasoning-Kette
+            scores: [batch, n_steps] — Verifikations-Scores
+        """
+        with torch.no_grad():
+            batch, d = hidden_state.shape
+            chain = []
+            scores = []
+            
+            current = hidden_state
+            for step in range(self.n_reasoning_steps):
+                # Schritt-Embedding hinzufügen
+                step_emb = self.step_embedding(
+                    torch.tensor([step], device=hidden_state.device)
+                ).expand(batch, -1)  # [batch, d]
+                
+                # Nächsten Reasoning-Schritt generieren
+                next_step = self.cot_decoder(current + step_emb * 0.1)
+                
+                # Verifikation: wie konsistent ist dieser Schritt?
+                verif_input = torch.cat([current, next_step], dim=-1)
+                score = torch.sigmoid(self.verification_net(verif_input)).squeeze(-1)
+                
+                chain.append(next_step)
+                scores.append(score)
+                
+                current = next_step
+            
+            return torch.stack(chain, dim=1), torch.stack(scores, dim=1)
+    
+    def tree_of_thought(self, hidden_state, return_best=True):
+        """
+        Erkunde mehrere Reasoning-Pfade parallel (Tree-of-Thought).
+        
+        Args:
+            hidden_state: [batch, d_model]
+            return_best: bool — Nur besten Pfad zurückgeben?
+        
+        Returns:
+            best_chain: [batch, n_steps, d_model] — Bester Pfad
+            best_scores: [batch, n_steps] — Scores des besten Pfads
+        """
+        with torch.no_grad():
+            batch, d = hidden_state.shape
+            
+            # Starte von aktuellem State
+            current = hidden_state.unsqueeze(1).expand(-1, self.n_tree_branches, -1)
+            # [batch, branches, d]
+            
+            all_scores = torch.zeros(batch, self.n_tree_branches, self.n_reasoning_steps,
+                                     device=hidden_state.device)
+            
+            for step in range(self.n_reasoning_steps):
+                step_emb = self.step_embedding(
+                    torch.tensor([step], device=hidden_state.device)
+                ).expand(batch, self.n_tree_branches, -1)
+                
+                # Router erzeugt verschiedene Fortsetzungen
+                # (nur beim ersten Schritt, danach per Decoder)
+                if step == 0:
+                    # Erste Verzweigung: baum_startet
+                    routes = self.tree_router(current[:, 0, :])  # [batch, branches*d]
+                    routes = routes.view(batch, self.n_tree_branches, d)
+                    next_steps = self.cot_decoder(
+                        (current[:, 0, :] + step_emb[:, 0, :] * 0.1).unsqueeze(1)
+                    )  # [batch, 1, d]
+                    next_steps = next_steps + routes * 0.3  # Diversität
+                else:
+                    next_steps = self.cot_decoder(
+                        current.view(-1, d) + step_emb.view(-1, d) * 0.1
+                    ).view(batch, self.n_tree_branches, d)
+                
+                # Verifikation jedes Pfads
+                for b in range(self.n_tree_branches):
+                    verif_in = torch.cat([current[:, b, :], next_steps[:, b, :]], dim=-1)
+                    score = torch.sigmoid(self.verification_net(verif_in)).squeeze(-1)
+                    all_scores[:, b, step] = score
+                
+                current = next_steps
+            
+            # Wähle besten Pfad pro Batch
+            avg_scores = all_scores.mean(dim=-1)  # [batch, branches]
+            best_branch = avg_scores.argmax(dim=-1)  # [batch]
+            
+            best_chain = torch.zeros(batch, self.n_reasoning_steps, d, device=hidden_state.device)
+            best_scores = torch.zeros(batch, self.n_reasoning_steps, device=hidden_state.device)
+            
+            for b in range(batch):
+                best_chain[b] = current[b, best_branch[b]]
+                best_scores[b] = all_scores[b, best_branch[b]]
+            
+            # Metriken
+            if self._metric_idx < 500:
+                idx = self._metric_idx % 500
+                self.tree_depth_history[idx] = self.n_tree_branches
+                self.verification_history[idx] = best_scores.mean().item()
+                self._metric_idx += 1
+            
+            return best_chain, best_scores
+    
+    def verify_reasoning(self, hidden_states, reasoning_chain):
+        """
+        Verifiziere eine gesamte Reasoning-Kette.
+        
+        Args:
+            hidden_states: [batch, seq, d_model] — Original-Kontext
+            reasoning_chain: [batch, n_steps, d_model] — Reasoning-Kette
+        
+        Returns:
+            overall_score: float — Gesamt-Qualität
+            step_scores: [batch, n_steps] — Einzelschritt-Scores
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            _, n_steps, _ = reasoning_chain.shape
+            
+            # Vergleiche Reasoning-Kette mit Original-Kontext
+            context_pooled = hidden_states.mean(dim=1)  # [batch, d]
+            
+            step_scores = []
+            for t in range(n_steps):
+                verif_in = torch.cat([
+                    context_pooled,
+                    reasoning_chain[:, t, :]
+                ], dim=-1)
+                score = torch.sigmoid(self.verification_net(verif_in)).squeeze(-1)
+                step_scores.append(score)
+            
+            step_scores = torch.stack(step_scores, dim=1)  # [batch, n_steps]
+            overall_score = step_scores.mean().item()
+            
+            # Qualitäts-Tracking
+            idx = self._quality_idx % 100
+            self.reasoning_quality[idx] = overall_score
+            self._quality_idx += 1
+            
+            return overall_score, step_scores
+    
+    def condition(self, hidden_states):
+        """
+        Konditioniere Hidden-States mit Reasoning.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+        
+        Returns:
+            conditioned: [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            
+            # Reasoning vom gepoolten Kontext starten
+            context = hidden_states.mean(dim=1)  # [batch, d]
+            
+            # Generiere Tree-of-Thought (nur jeder 5. Aufruf)
+            if self._quality_idx % 5 == 0:
+                best_chain, best_scores = self.tree_of_thought(context)
+                
+                # Integriere Reasoning in Hidden-States
+                reasoning_influence = best_chain.mean(dim=1, keepdim=True)  # [batch, 1, d]
+                return hidden_states + reasoning_influence * 0.05
+            
+            return hidden_states
+    
+    def get_reasoning_stats(self):
+        """Gib System-2-Reasoning-Statistiken."""
+        avg_verif = self.verification_history[:max(1, self._metric_idx)].mean().item()
+        avg_quality = self.reasoning_quality[:max(1, self._quality_idx)].mean().item()
+        return {
+            'avg_verification': avg_verif,
+            'avg_quality': avg_quality,
+            'n_reasoning_steps': self.n_reasoning_steps,
+            'n_tree_branches': self.n_tree_branches,
+            'n_verifications': min(self._metric_idx, 500),
+        }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -4027,6 +4272,7 @@ class CogLang:
         self._consciousness = None
         self._auto_curriculum = None
         self._causal_reasoning = None
+        self._system2_reasoning = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -4111,6 +4357,10 @@ class CogLang:
     def CausalReasoning(self, d_model, n_causal_factors=64, temperature=0.1):
         """PHASE 44: Causal Reasoning — Kausales Verständnis."""
         m = CausalReasoning(d_model, n_causal_factors, temperature); self.modules.append(m); self._causal_reasoning = m; return m
+    
+    def System2Reasoning(self, d_model, n_reasoning_steps=8, n_tree_branches=3, temperature=0.3):
+        """PHASE 45: System-2 Reasoning — Kettenbewusstsein + Verifikation + Gedankenbäume."""
+        m = System2Reasoning(d_model, n_reasoning_steps, n_tree_branches, temperature); self.modules.append(m); self._system2_reasoning = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -4281,6 +4531,24 @@ class CogLang:
                     }
             # Conditioning: moduliere pred mit kausalem Verständnis
             pred = self._causal_reasoning.condition(pred)
+        
+        # PHASE 45: System-2 Reasoning — Chain-of-Thought + Tree-of-Thought
+        if self._system2_reasoning is not None and not learn:
+            # Reasoning auf gepooltem Kontext
+            context = pred.mean(dim=1, keepdim=True)  # [batch, 1, d]
+            best_chain, best_scores = self._system2_reasoning.tree_of_thought(
+                context.squeeze(1), return_best=True
+            )
+            # Integriere Reasoning in Hidden-States
+            reasoning_influence = best_chain.mean(dim=1, keepdim=True)
+            pred = pred + reasoning_influence * 0.03
+            info_extra['reasoning'] = {
+                'avg_score': best_scores.mean().item(),
+                'quality': self._system2_reasoning.get_reasoning_stats()['avg_quality'],
+            }
+        elif self._system2_reasoning is not None:
+            # Im Lernmodus: nur Conditioning
+            pred = self._system2_reasoning.condition(pred)
         
         output, hidden = self._decoder(pred)
         
@@ -4690,6 +4958,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.ConsciousnessGlimpse(d_model=d_sparse, spotlight_size=1, n_glimpses=3)
     brain.AutoCurriculum(d_model=d_sparse, n_difficulty_levels=5, window_size=100)
     brain.CausalReasoning(d_model=d_sparse, n_causal_factors=64, temperature=0.1)
+    brain.System2Reasoning(d_model=d_sparse, n_reasoning_steps=8, n_tree_branches=3, temperature=0.3)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

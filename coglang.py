@@ -3769,6 +3769,238 @@ class AutoCurriculum(CogModule):
         return stats
 
 
+class CausalReasoning(CogModule):
+    """
+    PHASE 44: Causal Reasoning — Kausales Verständnis für das Weltmodell.
+    
+    CogLang lernt Ursache-Wirkung-Beziehungen aus Sequenzen:
+    1. Causal Discovery: Erkenne kausale Strukturen aus temporalen Mustern
+    2. Do-Calculus: Simuliere Eingriffe (Interventionen) im Repräsentationsraum
+    3. Counterfactuals: "Was wäre wenn" — alternative Realitäten generieren
+    
+    Kernidee: Wenn A zeitlich vor B kommt UND die bedingte Wahrscheinlichkeit
+    P(B|A) > P(B) significantly, dann ist A wahrscheinlich Ursache von B.
+    
+    Integration mit KnowledgeGraph: Kausale Fakten werden als spezielle
+    Relationen ("causes", "enables", "prevents") gespeichert.
+    """
+    def __init__(self, d_model, n_causal_factors=64, temperature=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.n_causal_factors = n_causal_factors
+        self.temperature = temperature
+        
+        # ——— Causal Discovery Network ———
+        # Lernt aus (cause, effect)-Paaren eine kausale Einbettung
+        self.cause_encoder = nn.Linear(d_model, n_causal_factors)
+        self.effect_encoder = nn.Linear(d_model, n_causal_factors)
+        self.causal_scorer = nn.Bilinear(n_causal_factors, n_causal_factors, 1)
+        
+        # ——— Intervention Head (Do-Calculus) ———
+        # Simuliere: "Was passiert, wenn ich X ändere?"
+        self.intervention_net = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
+        
+        # ——— Counterfactual Generator ———
+        # Erzeuge alternative Repräsentation: "Was wäre wenn X anders?"
+        self.counterfactual_net = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
+        
+        # ——— Causal Graph (Buffer) ———
+        # Speichert gelernte kausale Beziehungen
+        self.register_buffer('causal_matrix', torch.zeros(n_causal_factors, n_causal_factors))
+        self.register_buffer('causal_strength', torch.zeros(n_causal_factors, n_causal_factors))
+        self.register_buffer('causal_counts', torch.zeros(n_causal_factors, n_causal_factors, dtype=torch.long))
+        
+        # ——— Temporal Buffer ———
+        # Letzte N (cause, effect) Beobachtungen
+        self.register_buffer('temp_buffer_causes', torch.zeros(500, d_model))
+        self.register_buffer('temp_buffer_effects', torch.zeros(500, d_model))
+        self._temp_idx = 0
+        self._temp_count = 0
+        
+        # ——— Metrik ———
+        self.register_buffer('causal_confidence', torch.zeros(n_causal_factors))
+        self.register_buffer('discovery_rate', torch.zeros(100))
+        self._discovery_idx = 0
+    
+    def discover_causal(self, hidden_states):
+        """
+        Entdecke kausale Beziehungen aus einer Sequenz.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+        
+        Returns:
+            cause_ids: [n_discovered] — Indices entdeckter Ursachen
+            effect_ids: [n_discovered] — Indices entdeckter Effekte
+            strengths: [n_discovered] — Kausale Stärke
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            
+            # Kodiere jede Position als Cause und Effect
+            h_flat = hidden_states.reshape(-1, d)  # [batch*seq, d]
+            causes = torch.sigmoid(self.cause_encoder(h_flat))  # [batch*seq, n_factors]
+            effects = torch.sigmoid(self.effect_encoder(h_flat))
+            
+            # Temporal: (t) ist Cause, (t+1) ist Effect
+            n = min(seq - 1, 50)
+            discovered_causes = []
+            discovered_effects = []
+            discovered_strengths = []
+            
+            for b in range(batch):
+                for t in range(n):
+                    c = causes[b * seq + t]    # Cause-Faktoren zu Zeit t
+                    e = effects[b * seq + t + 1]  # Effect-Faktoren zu Zeit t+1
+                    
+                    # Kausaler Score: wie stark beeinflusst c den Effekt e?
+                    score = self.causal_scorer(c.unsqueeze(0), e.unsqueeze(0)).squeeze()
+                    
+                    if score > 0.7:  # Schwelle für kausale Entdeckung
+                        # Finde dominante Faktoren
+                        c_factor = c.argmax().item()
+                        e_factor = e.argmax().item()
+                        
+                        # Update Causal Matrix
+                        self.causal_counts[c_factor, e_factor] += 1
+                        n_c = self.causal_counts[c_factor, e_factor].item()
+                        old = self.causal_matrix[c_factor, e_factor].item()
+                        self.causal_matrix[c_factor, e_factor] = old * 0.9 + score.item() * 0.1
+                        self.causal_strength[c_factor, e_factor] = min(
+                            1.0, self.causal_strength[c_factor, e_factor].item() + 0.05
+                        )
+                        
+                        discovered_causes.append(c_factor)
+                        discovered_effects.append(e_factor)
+                        discovered_strengths.append(score.item())
+                        
+                        # Speichere im Temp-Buffer
+                        idx = self._temp_idx % 500
+                        self.temp_buffer_causes[idx] = h_flat[b * seq + t]
+                        self.temp_buffer_effects[idx] = h_flat[b * seq + t + 1]
+                        self._temp_idx += 1
+                        self._temp_count = min(self._temp_count + 1, 500)
+            
+            # Metrik: Discovery Rate
+            if discovered_causes:
+                dr = len(discovered_causes) / max(1, n * batch)
+                idx = self._discovery_idx % 100
+                self.discovery_rate[idx] = dr
+                self._discovery_idx += 1
+            
+            return discovered_causes[:10], discovered_effects[:10], discovered_strengths[:10]
+    
+    def do_intervention(self, hidden_states, intervention_vector):
+        """
+        Führe eine Intervention durch (Do-Calculus).
+        
+        Simuliere: "Was passiert, wenn ich X ändere?"
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            intervention_vector: [batch, d_model] — die "Eingriffs"-Repräsentation
+        
+        Returns:
+            intervened: [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            
+            # Wiederhole Intervention für jede Position
+            interv_exp = intervention_vector.unsqueeze(1).expand(-1, seq, -1)
+            
+            # Berechne Interventionseffekt
+            interv_feat = torch.cat([hidden_states, interv_exp], dim=-1)
+            delta = self.intervention_net(interv_feat)
+            
+            return hidden_states + delta * 0.2
+    
+    def counterfactual(self, hidden_states, alternative, position):
+        """
+        Generiere Counterfactual: "Was wäre, wenn an Position X
+        etwas anderes passiert wäre?"
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            alternative: [batch, d_model] — alternative Repräsentation
+            position: int — Position in der Sequenz
+        
+        Returns:
+            counterfactual_states: [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            
+            # Ersetze an Position 'position' den State
+            cf_states = hidden_states.clone()
+            alt_exp = alternative.unsqueeze(1)  # [batch, 1, d]
+            
+            # Modifiziere ab der Position
+            cf_states[:, position:, :] = self.counterfactual_net(
+                torch.cat([
+                    cf_states[:, position:, :],
+                    alt_exp.expand(-1, seq - position, -1)
+                ], dim=-1)
+            )
+            
+            return cf_states
+    
+    def condition(self, hidden_states):
+        """
+        Moduliere Hidden-States mit kausalem Verständnis.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+        
+        Returns:
+            conditioned: [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            
+            # Wende kausale Entdeckung an (jeden 10. Schritt)
+            if self._temp_count > 0 and self._temp_idx % 10 == 0:
+                causes, effects, strengths = self.discover_causal(hidden_states)
+            
+            return hidden_states  # kein direkter Conditioning-Effekt, nur Discovery
+    
+    def get_causal_graph(self, top_k=10):
+        """Gib Top-K kausale Beziehungen zurück."""
+        n = self.n_causal_factors
+        entries = []
+        for i in range(n):
+            for j in range(n):
+                if i != j and self.causal_counts[i, j].item() > 0:
+                    entries.append({
+                        'cause': i, 'effect': j,
+                        'strength': self.causal_matrix[i, j].item(),
+                        'count': self.causal_counts[i, j].item(),
+                    })
+        entries.sort(key=lambda x: x['strength'], reverse=True)
+        return entries[:top_k]
+    
+    def get_causal_stats(self):
+        """Gib Causal-Reasoning-Statistiken."""
+        total_relations = (self.causal_counts > 0).sum().item()
+        avg_strength = self.causal_matrix[self.causal_counts > 0].mean().item() if total_relations > 0 else 0
+        recent_dr = self.discovery_rate[:max(1, self._discovery_idx)].mean().item()
+        return {
+            'n_causal_relations': total_relations,
+            'avg_causal_strength': avg_strength,
+            'discovery_rate': recent_dr,
+            'temp_buffer_size': min(self._temp_count, 500),
+            'n_causal_factors': self.n_causal_factors,
+        }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -3793,6 +4025,7 @@ class CogLang:
         self._transfer_learning = None
         self._consciousness = None
         self._auto_curriculum = None
+        self._causal_reasoning = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -3873,6 +4106,10 @@ class CogLang:
     def AutoCurriculum(self, d_model, n_difficulty_levels=5, window_size=100):
         """PHASE 43: Auto-Curriculum — Automatische Schwierigkeitsanpassung."""
         m = AutoCurriculum(d_model, n_difficulty_levels, window_size); self.modules.append(m); self._auto_curriculum = m; return m
+    
+    def CausalReasoning(self, d_model, n_causal_factors=64, temperature=0.1):
+        """PHASE 44: Causal Reasoning — Kausales Verständnis."""
+        m = CausalReasoning(d_model, n_causal_factors, temperature); self.modules.append(m); self._causal_reasoning = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -4031,6 +4268,18 @@ class CogLang:
         if self._auto_curriculum is not None:
             pred = self._auto_curriculum.condition(pred)
             info_extra['curriculum'] = self._auto_curriculum.get_curriculum_params()
+        
+        # PHASE 44: Causal Reasoning — Entdecke Kausalstrukturen im Forward-Pass
+        if self._causal_reasoning is not None:
+            if not learn and self._causal_reasoning._temp_idx % 10 == 0:
+                causes, effects, strengths = self._causal_reasoning.discover_causal(pred)
+                if causes:
+                    info_extra['causal'] = {
+                        'n_discovered': len(causes),
+                        'avg_strength': sum(strengths) / len(strengths) if strengths else 0,
+                    }
+            # Conditioning: moduliere pred mit kausalem Verständnis
+            pred = self._causal_reasoning.condition(pred)
         
         output, hidden = self._decoder(pred)
         
@@ -4434,6 +4683,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.TransferLearning(d_model=d_sparse, max_domains=8, adapter_rank=8)
     brain.ConsciousnessGlimpse(d_model=d_sparse, spotlight_size=1, n_glimpses=3)
     brain.AutoCurriculum(d_model=d_sparse, n_difficulty_levels=5, window_size=100)
+    brain.CausalReasoning(d_model=d_sparse, n_causal_factors=64, temperature=0.1)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

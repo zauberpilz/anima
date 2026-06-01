@@ -2270,6 +2270,278 @@ class SelfReflection(CogModule):
         }
 
 
+class KnowledgeGraph(CogModule):
+    """
+    PHASE 38: Knowledge Graph — Explizites Weltwissen als Graph.
+    
+    CogLang speichert und ruft Faktenwissen in Form eines neuronalen Graphen ab.
+    Der Graph besteht aus (Entity, Relation, Entity)-Triplets, die als Embeddings
+    gespeichert sind.
+    
+    Kernfähigkeiten:
+    1. Store: Neue Fakten lernen (über Hebbian-ähnliche Updates)
+    2. Retrieve: Relevantes Wissen aus Kontext abrufen
+    3. Query: Gezielte Fragen beantworten (Entity → Relation → Entity)
+    4. Condition: Abgerufenes Wissen in Forward-Pass einweben
+    
+    Der Graph wächst dynamisch mit dem Training.
+    """
+    def __init__(self, d_model, max_entities=1024, max_relations=64):
+        super().__init__()
+        self.d_model = d_model
+        self.max_entities = max_entities
+        self.max_relations = max_relations
+        
+        # ——— Embeddings ———
+        # Entity-Embeddings: Jede Entität ist ein d_model-Vektor
+        self.entity_embeddings = nn.Embedding(max_entities, d_model)
+        # Relation-Embeddings: Jede Relation ist ein d_model-Vektor
+        self.relation_embeddings = nn.Embedding(max_relations, d_model)
+        
+        # ——— Scoring Network ———
+        # Bewertet (sub, rel, obj)-Triple: Score = f(sub_emb, rel_emb, obj_emb)
+        self.scorer = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1),
+        )
+        
+        # ——— Context-to-Entity Projektion ———
+        # Wandelt Kontext-Embedding in Entity-Space (für Retrieval)
+        self.ctx_to_entity = nn.Linear(d_model, d_model, bias=False)
+        
+        # ——— Knowledge Conditioning ———
+        # Webe abgerufenes Wissen in Hidden-States ein
+        self.knowledge_gate = nn.Linear(d_model * 2, d_model)
+        
+        # ——— Graph-Struktur (Buffer) ———
+        # Adjazenzliste: speichert Triple-IDs
+        self.register_buffer('graph_subjects', torch.zeros(max_entities * 4, dtype=torch.long))
+        self.register_buffer('graph_relations', torch.zeros(max_entities * 4, dtype=torch.long))
+        self.register_buffer('graph_objects', torch.zeros(max_entities * 4, dtype=torch.long))
+        self.register_buffer('graph_scores', torch.zeros(max_entities * 4))
+        self.register_buffer('entity_count', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('relation_count', torch.zeros(1, dtype=torch.long))
+        self._graph_idx = 0
+        
+        # ——— Entity-Name Mapping (metadaten) ———
+        self.entity_names = {}  # idx -> name (nicht im Checkpoint)
+        self.relation_names = {}  # idx -> name
+        
+        # ——— Metrik ———
+        self.register_buffer('query_success_rate', torch.zeros(100))
+        self._query_idx = 0
+        self._max_weight = 3.0
+        
+    def add_entity(self, name=None):
+        """Füge neue Entität hinzu. Gib Index zurück."""
+        idx = self.entity_count.item()
+        if idx < self.max_entities:
+            if name:
+                self.entity_names[idx] = name
+            self.entity_count += 1
+        return idx % self.max_entities
+    
+    def add_relation(self, name=None):
+        """Füge neue Relation hinzu. Gib Index zurück."""
+        idx = self.relation_count.item()
+        if idx < self.max_relations:
+            if name:
+                self.relation_names[idx] = name
+            self.relation_count += 1
+        return idx % self.max_relations
+    
+    def store_triple(self, subject, relation, object, score=1.0):
+        """
+        Speichere (sub, rel, obj)-Triple im Graph.
+        
+        Args:
+            subject: int — Entity-Index
+            relation: int — Relation-Index
+            object: int — Entity-Index
+            score: float — Confidence dieses Wissens (0-1)
+        """
+        with torch.no_grad():
+            idx = self._graph_idx % (self.max_entities * 4)
+            self.graph_subjects[idx] = subject
+            self.graph_relations[idx] = relation
+            self.graph_objects[idx] = object
+            self.graph_scores[idx] = score
+            self._graph_idx += 1
+            
+            # Hebbian-ähnliches Update: verstärke Embeddings
+            sub_emb = self.entity_embeddings.weight[subject]
+            rel_emb = self.relation_embeddings.weight[relation]
+            obj_emb = self.entity_embeddings.weight[object]
+            
+            # Verschiebe Embeddings zueinander (Konsistenz-Lernen)
+            # sub + rel ≈ obj (in Embedding-Space)
+            predicted_obj = sub_emb + rel_emb
+            error = predicted_obj - obj_emb
+            self.entity_embeddings.weight.data[object] += error * 0.01
+            self.entity_embeddings.weight.data[subject] += error * 0.005  # Schwächer für Subjekt
+            self.relation_embeddings.weight.data[relation] += error * 0.01
+            
+            # Clamp
+            self.entity_embeddings.weight.data.clamp_(-self._max_weight, self._max_weight)
+            self.relation_embeddings.weight.data.clamp_(-self._max_weight, self._max_weight)
+    
+    def query(self, subject, relation, top_k=5):
+        """
+        Frage Graph: (sub, rel, ?) — welche Objekte passen?
+        
+        Args:
+            subject: int — Entity-Index
+            relation: int — Relation-Index
+            top_k: int — Anzahl Ergebnisse
+        
+        Returns:
+            indices: [top_k] — Objekt-Indices
+            scores: [top_k] — Confidence-Scores
+        """
+        with torch.no_grad():
+            sub_emb = self.entity_embeddings.weight[subject].unsqueeze(0)  # [1, d]
+            rel_emb = self.relation_embeddings.weight[relation].unsqueeze(0)  # [1, d]
+            
+            # Gespeicherte Objekte durchsuchen
+            n = min(self._graph_idx, self.max_entities * 4)
+            if n == 0:
+                return torch.zeros(0, dtype=torch.long), torch.zeros(0)
+            
+            stored_objects = self.graph_objects[:n]
+            stored_scores = self.graph_scores[:n]
+            
+            # Scorer: (sub, rel, obj) → Score
+            sub_exp = sub_emb.expand(n, -1)
+            rel_exp = rel_emb.expand(n, -1)
+            obj_embs = self.entity_embeddings(stored_objects)
+            
+            triple_feat = torch.cat([sub_exp, rel_exp, obj_embs], dim=-1)
+            triple_scores = torch.sigmoid(self.scorer(triple_feat)).squeeze(-1)
+            
+            # Kombiniere gelernten Score mit gespeichertem Score
+            final_scores = triple_scores * 0.7 + stored_scores[:n] * 0.3
+            
+            # Top-K
+            k = min(top_k, n)
+            top_scores, top_idx = torch.topk(final_scores, k)
+            top_objects = stored_objects[top_idx]
+            
+            return top_objects, top_scores
+    
+    def retrieve(self, context_embedding, top_k=3):
+        """
+        Retrieve relevant knowledge from context.
+        
+        Args:
+            context_embedding: [batch, d_model] — Aktueller Kontext
+            top_k: int — Anzahl relevanter Fakten
+        
+        Returns:
+            facts: dict mit abgerufenen Fakten
+        """
+        with torch.no_grad():
+            batch = context_embedding.size(0)
+            n = min(self._graph_idx, self.max_entities * 4)
+            
+            if n == 0:
+                return {
+                    'embeddings': torch.zeros(batch, 0, self.d_model, device=context_embedding.device),
+                    'scores': torch.zeros(batch, 0),
+                    'n_facts': 0,
+                }
+            
+            # Projiziere Kontext in Entity-Space
+            ctx_entity = self.ctx_to_entity(context_embedding)  # [batch, d]
+            
+            # Ähnlichkeit mit allen Entitäten
+            all_entities = self.entity_embeddings.weight[:self.entity_count.item()]  # [n_ent, d]
+            similarity = ctx_entity @ all_entities.T  # [batch, n_ent]
+            
+            # Finde relevanteste Entitäten
+            top_entities = torch.topk(similarity, min(top_k, self.entity_count.item()), dim=-1)
+            
+            # Retrieve Fakten für diese Entitäten
+            fact_list = []
+            for b in range(batch):
+                for e_idx in top_entities.indices[b]:
+                    # Finde alle Triples mit dieser Entity als Subjekt
+                    mask = self.graph_subjects[:n] == e_idx
+                    fact_indices = torch.where(mask)[0]
+                    if len(fact_indices) > 0:
+                        # Nimm das erste
+                        fi = fact_indices[0]
+                        rel = self.graph_relations[fi]
+                        obj = self.graph_objects[fi]
+                        
+                        rel_emb = self.relation_embeddings.weight[rel]
+                        obj_emb = self.entity_embeddings.weight[obj]
+                        
+                        # Kombiniere zu Fakt-Embedding
+                        fact_emb = rel_emb + obj_emb
+                        fact_list.append((fact_emb, self.graph_scores[fi].item()))
+            
+            if not fact_list:
+                return {
+                    'embeddings': torch.zeros(batch, 1, self.d_model, device=context_embedding.device),
+                    'scores': torch.zeros(batch, 1),
+                    'n_facts': 0,
+                }
+            
+            # Stacke Fakten
+            fact_embs = torch.stack([f[0] for f in fact_list])  # [n_facts, d]
+            fact_scores = torch.tensor([f[1] for f in fact_list], device=context_embedding.device)
+            
+            return {
+                'embeddings': fact_embs.unsqueeze(0).expand(batch, -1, -1),
+                'scores': fact_scores.unsqueeze(0).expand(batch, -1),
+                'n_facts': len(fact_list),
+            }
+    
+    def condition(self, hidden_states, knowledge_embeddings, knowledge_scores=None):
+        """
+        Moduliere Hidden-States mit abgerufenem Wissen.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            knowledge_embeddings: [batch, n_facts, d_model]
+            knowledge_scores: [batch, n_facts] oder None
+        
+        Returns:
+            modulated: [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            n_facts = knowledge_embeddings.size(1)
+            
+            if n_facts == 0:
+                return hidden_states
+            
+            # Gewichtete Summe der Fakten
+            if knowledge_scores is not None:
+                fact_weights = torch.softmax(knowledge_scores / 0.1, dim=-1)  # [batch, n_facts]
+                fact_aggr = (fact_weights.unsqueeze(-1) * knowledge_embeddings).sum(dim=1)  # [batch, d]
+            else:
+                fact_aggr = knowledge_embeddings.mean(dim=1)  # [batch, d]
+            
+            # Gate: wie viel Wissen soll rein?
+            fact_expanded = fact_aggr.unsqueeze(1).expand(-1, seq, -1)
+            gate_in = torch.cat([hidden_states, fact_expanded], dim=-1)
+            gate = torch.sigmoid(self.knowledge_gate(gate_in))
+            
+            return hidden_states + gate * fact_expanded * 0.2
+    
+    def get_graph_stats(self):
+        """Gibt Graph-Statistiken zurück."""
+        return {
+            'entities': self.entity_count.item(),
+            'relations': self.relation_count.item(),
+            'triples': min(self._graph_idx, self.max_entities * 4),
+            'max_entities': self.max_entities,
+            'max_relations': self.max_relations,
+        }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -2288,6 +2560,7 @@ class CogLang:
         self._sleep_replay = None
         self._goal_encoder = None
         self._self_reflection = None
+        self._knowledge_graph = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -2344,6 +2617,10 @@ class CogLang:
     def SelfReflection(self, d_model, n_confidence_bins=5):
         """PHASE 37: Self-Reflection — Meta-Kognitive Selbstkritik."""
         m = SelfReflection(d_model, n_confidence_bins); self.modules.append(m); self._self_reflection = m; return m
+    
+    def KnowledgeGraph(self, d_model, max_entities=1024, max_relations=64):
+        """PHASE 38: Knowledge Graph — Explizites Weltwissen."""
+        m = KnowledgeGraph(d_model, max_entities, max_relations); self.modules.append(m); self._knowledge_graph = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -2439,6 +2716,19 @@ class CogLang:
         if self._skills is not None:
             pred = self._skills(pred, context=sparse_x)
         
+        info_extra = {}
+        
+        # PHASE 38: Knowledge Graph — Retrieve relevant knowledge and condition
+        if self._knowledge_graph is not None:
+            ctx_pooled = sparse_x.mean(dim=1)  # [batch, d_sparse]
+            knowledge = self._knowledge_graph.retrieve(ctx_pooled, top_k=3)
+            if knowledge['n_facts'] > 0:
+                pred = self._knowledge_graph.condition(pred, knowledge['embeddings'], knowledge['scores'])
+                info_extra['knowledge'] = {
+                    'n_facts': knowledge['n_facts'],
+                    'graph_stats': self._knowledge_graph.get_graph_stats(),
+                }
+        
         output, hidden = self._decoder(pred)
         
         # PHASE 8: Apply neuro-symbolic rules to output
@@ -2446,7 +2736,6 @@ class CogLang:
             output = self._bridge(output, context_embedding=sparse_x)
             
         # PHASE 35: HierarchicalPC Level Report
-        info_extra = {}
         if hasattr(self._stack, 'get_level_report'):
             info_extra['level_report'] = self._stack.get_level_report()
         
@@ -2789,6 +3078,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.SkillModule(d_model=d_sparse, n_skills=n_skills)
     brain.GoalEncoder(d_model=d_sparse, max_goal_len=50)
     brain.SelfReflection(d_model=d_sparse)
+    brain.KnowledgeGraph(d_model=d_sparse, max_entities=1024, max_relations=64)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

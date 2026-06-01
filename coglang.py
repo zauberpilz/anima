@@ -2816,6 +2816,207 @@ class ToolUse(CogModule):
         return stats
 
 
+class MultiAgent(CogModule):
+    """
+    PHASE 40: Multi-Agent Self-Play — Zwei Persönlichkeiten, eine Architektur.
+    
+    CogLang bekommt zwei 'Persona'-Embeddings (These/Antithese oder Fokus/Kreativ).
+    Beide teilen sich die gleichen Gewichte, aber erhalten unterschiedliche
+    Bias-Vektoren. Dadurch entsteht eine interne Perspektivenvielfalt:
+    
+    1. Persona A (These): konservativ, fokussiert, präzise
+    2. Persona B (Anti-These): kreativ, explorativ, assoziativ
+    3. Synthese: Beide Outputs werden verglichen und Agreement gemessen
+    
+    Lerneffekt:
+    - Agreement→Rauschen: Konsens stärkt Überzeugungen
+    - Disagreement→Exploration: Uneinigkeit treibt Lernen an
+    """
+    def __init__(self, d_model, n_personas=2):
+        super().__init__()
+        self.d_model = d_model
+        self.n_personas = n_personas
+        
+        # ——— Persona Embeddings ———
+        # Jede Persönlichkeit bekommt einen d_model-Vektor
+        self.persona_embeddings = nn.Embedding(n_personas, d_model)
+        
+        # ——— Persona Modulation ———
+        # Moduliere Hidden-States je nach aktiver Persona
+        self.persona_gate = nn.Linear(d_model * 2, d_model)
+        
+        # ——— Agreement Scorer ———
+        # Misst, wie stark beide Persönlichkeiten übereinstimmen
+        self.agreement_scorer = nn.Sequential(
+            nn.Linear(d_model * 4, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid(),
+        )
+        
+        # ——— Synthese ———
+        # Kombiniere beide Perspektiven zu einer Synthese
+        self.synthesis_net = nn.Linear(d_model * 2, d_model)
+        
+        # —── Persona-Profile (Metadaten) ———
+        self.persona_names = ['focus', 'creative']
+        self.persona_prompts = [
+            'Fokussiere auf Präzision, Logik und Konsistenz.',
+            'Denke kreativ, mach Assoziationen, denk um die Ecke.',
+        ]
+        
+        # ——— Metrik ———
+        self.register_buffer('agreement_history', torch.zeros(200))
+        self.register_buffer('synergy_score', torch.zeros(1))
+        self._agreement_idx = 0
+        
+        # Initialisiere Persona-Embeddings mit unterschiedlichen Bias
+        with torch.no_grad():
+            nn.init.normal_(self.persona_embeddings.weight, std=0.1)
+            # Persona 0: leicht negativ (konservativ)
+            self.persona_embeddings.weight.data[0] -= 0.2
+            # Persona 1: leicht positiv (explorativ)
+            self.persona_embeddings.weight.data[1] += 0.2
+    
+    def get_persona_embedding(self, persona_id, batch=1, device=None):
+        """Hole Embedding für eine Persönlichkeit."""
+        emb = self.persona_embeddings(
+            torch.tensor([persona_id], device=device)
+        )  # [1, d]
+        return emb.expand(batch, -1)  # [batch, d]
+    
+    def condition(self, hidden_states, persona_id):
+        """
+        Moduliere Hidden-States mit einer Persönlichkeit.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            persona_id: int (0 oder 1)
+        
+        Returns:
+            modulated: [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            persona_emb = self.get_persona_embedding(
+                persona_id, batch, hidden_states.device
+            )  # [batch, d]
+            
+            # Gate: Persona-Bias einweben
+            persona_exp = persona_emb.unsqueeze(1).expand(-1, seq, -1)
+            gate_in = torch.cat([hidden_states, persona_exp], dim=-1)
+            gate = torch.sigmoid(self.persona_gate(gate_in))
+            
+            return hidden_states + gate * persona_exp * 0.3
+    
+    def compute_agreement(self, states_a, states_b):
+        """
+        Berechne Übereinstimmung zwischen beiden Persönlichkeiten.
+        
+        Args:
+            states_a: [batch, seq, d_model] — Hidden-States von Persona A
+            states_b: [batch, seq, d_model] — Hidden-States von Persona B
+        
+        Returns:
+            agreement: [batch, seq] — 0 (widersprüchlich) bis 1 (übereinstimmend)
+            synthesis: [batch, seq, d_model] — kombinierte Synthese
+        """
+        with torch.no_grad():
+            # Agreement: cos-Ähnlichkeit zwischen beiden Perspektiven
+            a_flat = states_a.reshape(-1, self.d_model)
+            b_flat = states_b.reshape(-1, self.d_model)
+            
+            cos_sim = F.cosine_similarity(a_flat, b_flat, dim=-1)  # [batch*seq]
+            agreement = (cos_sim + 1) / 2  # Normalize to [0, 1]
+            agreement = agreement.reshape(states_a.shape[0], states_a.shape[1])
+            
+            # Scorer-basiertes Agreement (lernt feinere Muster)
+            combined = torch.cat([states_a, states_b], dim=-1)  # [batch, seq, 2*d]
+            combined_flat = combined.reshape(-1, self.d_model * 2)
+            scored = self.agreement_scorer(combined_flat)
+            scored = scored.reshape(states_a.shape[0], states_a.shape[1])
+            
+            # Gemischtes Agreement
+            final_agreement = agreement * 0.4 + scored * 0.6
+            
+            # Synthese: beide Perspektiven kombinieren
+            combined_2d = combined.reshape(-1, self.d_model * 2)
+            synthesis = self.synthesis_net(combined_2d)
+            synthesis = synthesis.reshape(states_a.shape[0], states_a.shape[1], self.d_model)
+            
+            return final_agreement, synthesis
+    
+    def debate_step(self, states_a, states_b, input_ids):
+        """
+        Ein Debate-Schritt zwischen beiden Persönlichkeiten.
+        
+        Args:
+            states_a: Hidden-States von Persona A
+            states_b: Hidden-States von Persona B
+            input_ids: Original Input
+        
+        Returns:
+            dict mit Agreement, Synthesis, Metriken
+        """
+        with torch.no_grad():
+            agreement, synthesis = self.compute_agreement(states_a, states_b)
+            
+            # Metrik aktualisieren
+            avg_agreement = agreement.mean().item()
+            idx = self._agreement_idx % 200
+            self.agreement_history[idx] = avg_agreement
+            self._agreement_idx += 1
+            
+            # Synergie: wenn Agreement niedrig, ist Synergie niedrig (Streit)
+            # Wenn Agreement hoch, ist Synergie hoch (Kooperation)
+            self.synergy_score[0] = avg_agreement * 2 - 1  # [-1, 1]
+            
+            return {
+                'agreement': agreement,  # [batch, seq]
+                'agreement_mean': avg_agreement,
+                'synthesis': synthesis,  # [batch, seq, d_model]
+                'synergy': self.synergy_score[0].item(),
+                'persona_a': self.persona_names[0],
+                'persona_b': self.persona_names[1],
+            }
+    
+    def learn_from_debate(self, states_a, states_b, agreement, target_agreement=0.7):
+        """
+        Lerne aus dem Debattenergebnis.
+        
+        Args:
+            states_a: Hidden-States von Persona A
+            states_b: Hidden-States von Persona B
+            agreement: Agreement-Matrix [batch, seq]
+            target_agreement: float — Ziel-Übereinstimmung
+        """
+        with torch.no_grad():
+            # Agreement-Ist vs. Soll
+            agreement_error = target_agreement - agreement.mean()
+            
+            # Verschiebe Persona-Embeddings leicht je nach Agreement
+            if abs(agreement_error) > 0.1:
+                # Bei zu starkem Dissens: ziehe Personas näher zusammen
+                # Bei zu starkem Konsens: trenne sie leicht
+                delta = agreement_error * 0.001  # Sehr sanft
+                self.persona_embeddings.weight.data[0] += delta
+                self.persona_embeddings.weight.data[1] -= delta
+                self.persona_embeddings.weight.data.clamp_(-1.0, 1.0)
+    
+    def get_debate_stats(self):
+        """Gib Debate-Statistiken zurück."""
+        recent = self.agreement_history[:max(1, self._agreement_idx)]
+        stable_agreement = recent.mean().item() if self._agreement_idx > 0 else 0.5
+        return {
+            'agreement_mean': stable_agreement,
+            'synergy': self.synergy_score[0].item(),
+            'persona_a': self.persona_names[0],
+            'persona_b': self.persona_names[1],
+            'n_personas': self.n_personas,
+            'agreement_history_len': min(self._agreement_idx, 200),
+        }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -2836,6 +3037,7 @@ class CogLang:
         self._self_reflection = None
         self._knowledge_graph = None
         self._tool_use = None
+        self._multi_agent = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -2900,6 +3102,10 @@ class CogLang:
     def ToolUse(self, d_model, max_tool_history=64):
         """PHASE 39: Tool Use — Externe Werkzeuge aufrufen."""
         m = ToolUse(d_model, max_tool_history); self.modules.append(m); self._tool_use = m; return m
+    
+    def MultiAgent(self, d_model, n_personas=2):
+        """PHASE 40: Multi-Agent Self-Play — Zwei Persönlichkeiten."""
+        m = MultiAgent(d_model, n_personas); self.modules.append(m); self._multi_agent = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -3007,6 +3213,24 @@ class CogLang:
                     'n_facts': knowledge['n_facts'],
                     'graph_stats': self._knowledge_graph.get_graph_stats(),
                 }
+        
+        # PHASE 40: Multi-Agent Self-Play — Perspektivenvielfalt
+        if self._multi_agent is not None and not learn:
+            # Persona-konditionierte Varianten von pred
+            pred_a = self._multi_agent.condition(pred, persona_id=0)  # konservativ
+            pred_b = self._multi_agent.condition(pred, persona_id=1)  # kreativ
+            
+            # Agreement zwischen beiden Perspektiven
+            debate_info = self._multi_agent.debate_step(pred_a, pred_b, input_ids)
+            info_extra['debate'] = debate_info
+            
+            # Mittle pred und konditionierte Varianten
+            pred = (pred + pred_a + pred_b) / 3
+        elif self._multi_agent is not None and learn:
+            # Im Lernmodus: abwechselnde Personas
+            persona_id = torch.randint(0, 2, (1,)).item()
+            pred = self._multi_agent.condition(pred, persona_id=persona_id)
+            info_extra['debate_persona'] = persona_id
         
         output, hidden = self._decoder(pred)
         
@@ -3122,6 +3346,18 @@ class CogLang:
                 reflection = info.get('reflection')
                 if reflection:
                     self._self_reflection.learn_step(reflection, loss.item())
+            
+            # PHASE 40: Multi-Agent learn_step — lerne aus Debattenergebnissen
+            if self._multi_agent is not None:
+                debate = info.get('debate')
+                if debate:
+                    # Agreement-Target hängt vom Loss ab: niedriger Loss → mehr Agreement
+                    target_agreement = 0.5 + 0.3 * (1.0 - min(loss.item(), 10.0) / 10.0)
+                    self._multi_agent.learn_from_debate(
+                        info['pred'], info['pred'],
+                        debate['agreement'],
+                        target_agreement=target_agreement,
+                    )
             
             # PHASE 13b: EvolutionStrategy inline learn_step — Plateau-noise + Revert
             if self._es is not None and self._ewc_step_counter % 100 == 0:
@@ -3380,6 +3616,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.SelfReflection(d_model=d_sparse)
     brain.KnowledgeGraph(d_model=d_sparse, max_entities=1024, max_relations=64)
     brain.ToolUse(d_model=d_sparse, max_tool_history=64)
+    brain.MultiAgent(d_model=d_sparse, n_personas=2)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

@@ -799,6 +799,7 @@ def run_evolution():
                             # PHASE 33: Active Inference Report
                             'active_inference': brain.get_active_inference_report() if hasattr(brain, 'get_active_inference_report') else {},
                             'level_report': info.get('level_report', {}),
+                            'reflection': info.get('reflection', {}),
                         }
                         with open('/home/anima/train_state.json', 'w') as sf:
                             json.dump(state, sf)

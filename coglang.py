@@ -2086,6 +2086,190 @@ class GoalEncoder(CogModule):
             self._goal_idx += 1
 
 
+class SelfReflection(CogModule):
+    """
+    PHASE 37: Self-Reflection — Meta-Kognitive Selbstkritik.
+    
+    Das Modell überwacht seine eigenen Gedanken (System 2 über System 1):
+    
+    1. Confidence Scoring: Wie sicher ist die aktuelle Prediction?
+    2. Consistency Check: Sind aufeinanderfolgende Tokens konsistent?
+    3. Contradiction Detection: Logische Brüche im generierten Text
+    4. Uncertainty Quantification: Wann sollte das Modell "Ich weiß es nicht" sagen?
+    
+    Lernsignal: Wenn das Modell einen Fehler macht (hoher Loss), soll es lernen,
+    diese Situationen vorherzusehen und entweder korrektur oder vorsichtiger zu sein.
+    """
+    def __init__(self, d_model, n_confidence_bins=5):
+        super().__init__()
+        self.d_model = d_model
+        self.n_bins = n_confidence_bins
+        
+        # ——— Confidence Estimator ———
+        # Schätzt die Wahrscheinlichkeit, dass die aktuelle Prediction korrekt ist
+        self.confidence_net = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.Tanh(),
+            nn.Linear(d_model // 2, 1),
+        )
+        
+        # ——— Consistency Scorer ———
+        # Bewertet, ob zwei aufeinanderfolgende Hidden-States konsistent sind
+        # (plötzliche Sprünge deuten auf Inkonsistenz/Verwirrung hin)
+        self.consistency_net = nn.Linear(d_model * 2, 1)
+        
+        # ——— Contradiction Detector ———
+        # Erkennt Widersprüche im Output (z.B. "es ist heiß" → "es schneit")
+        # Durch Vergleich der aktuellen und vorherigen Kontext-Embeddings
+        self.contradiction_net = nn.Linear(d_model, 1)
+        
+        # ——— Self-Question Generator ———
+        # Erzeugt ein Embedding, das Bereiche mit hoher Unsicherheit markiert
+        self.question_proj = nn.Linear(d_model, d_model)
+        
+        # ——— Metrik-Tracking ———
+        self.register_buffer('confidence_history', torch.zeros(1000))
+        self.register_buffer('consistency_history', torch.zeros(1000))
+        self.register_buffer('contradiction_history', torch.zeros(1000))
+        self._metric_idx = 0
+        self._prev_state = None  # Letzter Hidden-State für Consistency-Check
+        
+        self._max_weight = 2.0
+        
+    def forward(self, hidden_states, logits=None, prev_hidden=None):
+        """
+        Führe Self-Reflection auf aktuellen Hidden-States aus.
+        
+        Args:
+            hidden_states: [batch, seq, d_model] — Aktuelle Hidden-States
+            logits: [batch, seq, vocab] oder None — Output-Logits
+            prev_hidden: [batch, d_model] oder None — Vorheriger Hidden-State
+            
+        Returns:
+            dict mit Reflection-Ergebnissen
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            
+            # ——— 1. Confidence per Token ———
+            # Niedrige Aktivierung = unsichere Prediction
+            conf_features = hidden_states  # [batch, seq, d_model]
+            raw_conf = self.confidence_net(conf_features)  # [batch, seq, 1]
+            confidence = torch.sigmoid(raw_conf)  # [batch, seq, 1]
+            avg_confidence = confidence.mean().item()
+            
+            # ——— 2. Consistency Check ———
+            # Vergleiche aufeinanderfolgende Hidden-States
+            consistency_scores = []
+            for t in range(1, seq):
+                pair = torch.cat([hidden_states[:, t-1, :], hidden_states[:, t, :]], dim=-1)
+                cons = torch.sigmoid(self.consistency_net(pair))  # [batch, 1]
+                consistency_scores.append(cons)
+            
+            if consistency_scores:
+                avg_consistency = torch.stack(consistency_scores).mean().item()
+            else:
+                avg_consistency = 0.5
+            
+            # ——— 3. Contradiction Detection ———
+            # Suche nach plötzlichen Änderungen in der Repräsentation
+            # (deutet auf Widerspruch oder Themenwechsel hin)
+            state_deltas = []
+            for t in range(1, min(seq, 10)):  # Nur erste 10 Schritte
+                delta = hidden_states[:, t, :] - hidden_states[:, t-1, :]
+                contrad = torch.sigmoid(self.contradiction_net(delta))
+                state_deltas.append(contrad)
+            
+            if state_deltas:
+                contradiction_risk = torch.stack(state_deltas).mean().item()
+            else:
+                contradiction_risk = 0.0
+            
+            # ——— 4. Previous State Consistency (über Generation hinweg) ———
+            if prev_hidden is not None:
+                # Vergleiche ersten aktuellen State mit letztem vorherigen State
+                pair = torch.cat([prev_hidden, hidden_states[:, 0, :]], dim=-1)
+                gen_consistency = torch.sigmoid(self.consistency_net(pair)).mean().item()
+            else:
+                gen_consistency = 0.5
+            
+            # ——— 5. Unsicherheits-Markierung ———
+            low_conf_mask = (confidence < 0.3).float()  # [batch, seq, 1]
+            uncertainty_signal = self.question_proj(hidden_states) * low_conf_mask
+            
+            # ——— 6. Metriken speichern ———
+            idx = self._metric_idx % 1000
+            self.confidence_history[idx] = avg_confidence
+            self.consistency_history[idx] = avg_consistency
+            self.contradiction_history[idx] = contradiction_risk
+            self._metric_idx += 1
+            
+            # ——— 7. Gesamt-Reflection-Score ———
+            # Gewichtete Kombination aus Confidence, Consistency und Contradiction
+            reflection_score = (
+                0.4 * avg_confidence + 
+                0.3 * avg_consistency + 
+                0.3 * (1.0 - contradiction_risk)
+            )
+            
+            return {
+                'confidence': avg_confidence,
+                'confidence_per_token': confidence,  # [batch, seq, 1]
+                'consistency': avg_consistency,
+                'contradiction_risk': contradiction_risk,
+                'gen_consistency': gen_consistency,
+                'reflection_score': reflection_score,
+                'uncertainty_signal': uncertainty_signal,
+                'low_conf_mask': low_conf_mask,
+            }
+    
+    def learn_step(self, reflection_result, loss_value):
+        """
+        Lerne aus Self-Reflection: Verbessere die Selbsteinschätzung.
+        
+        Args:
+            reflection_result: dict von forward()
+            loss_value: float — Tatsächlicher Loss (wie falsch lag das Modell?)
+        """
+        with torch.no_grad():
+            confidence = reflection_result['confidence']
+            consistency = reflection_result['consistency']
+            
+            # Ziel: Confidence soll mit tatsächlichem Loss korrelieren
+            # Wenn Loss hoch ist, sollte Confidence niedrig sein
+            # Ideales Confidence-Signal: inverse Loss-Normalisierung
+            target_confidence = 1.0 / (1.0 + loss_value * 2.0)
+            target_confidence = max(0.1, min(0.9, target_confidence))
+            
+            # Confidence-Update
+            conf_error = target_confidence - confidence
+            # Kleine Hebbian-Anpassung (sehr sanft, da Confidence stabil bleiben soll)
+            for param in self.confidence_net.parameters():
+                if hasattr(param, 'data') and param.data is not None:
+                    param.data.add_(conf_error * 0.0001 * torch.randn_like(param.data) * 0.01)
+                    param.data.clamp_(-self._max_weight, self._max_weight)
+            
+            # Consistency-Update: Bei hohem Loss, Consistency runter
+            if loss_value > 1.0:
+                cons_error = 0.3 - consistency  # Ziel: niedrige Consistency bei Fehlern
+                for param in self.consistency_net.parameters():
+                    if hasattr(param, 'data') and param.data is not None:
+                        param.data.add_(cons_error * 0.0001 * torch.randn_like(param.data) * 0.01)
+                        param.data.clamp_(-self._max_weight, self._max_weight)
+    
+    def get_report(self):
+        """Gibt aktuelle Self-Reflection Metriken zurück."""
+        recent_conf = self.confidence_history[:self._metric_idx].tolist() if self._metric_idx > 0 else [0.5]
+        recent_cons = self.consistency_history[:self._metric_idx].tolist() if self._metric_idx > 0 else [0.5]
+        
+        return {
+            'avg_confidence': f'{sum(recent_conf[-100:])/max(1,len(recent_conf[-100:])):.3f}' if recent_conf else '0.500',
+            'avg_consistency': f'{sum(recent_cons[-100:])/max(1,len(recent_cons[-100:])):.3f}' if recent_cons else '0.500',
+            'avg_contradiction': f'{self.contradiction_history[:self._metric_idx].mean().item():.3f}' if self._metric_idx > 0 else '0.000',
+            'reflection_active': self._metric_idx > 100,
+        }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -2103,6 +2287,7 @@ class CogLang:
         self._network_encoder = None
         self._sleep_replay = None
         self._goal_encoder = None
+        self._self_reflection = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -2155,6 +2340,10 @@ class CogLang:
     def GoalEncoder(self, d_model, max_goal_len=50):
         """PHASE 36: Goal-Directed Generation."""
         m = GoalEncoder(d_model, max_goal_len); self.modules.append(m); self._goal_encoder = m; return m
+    
+    def SelfReflection(self, d_model, n_confidence_bins=5):
+        """PHASE 37: Self-Reflection — Meta-Kognitive Selbstkritik."""
+        m = SelfReflection(d_model, n_confidence_bins); self.modules.append(m); self._self_reflection = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -2260,6 +2449,14 @@ class CogLang:
         info_extra = {}
         if hasattr(self._stack, 'get_level_report'):
             info_extra['level_report'] = self._stack.get_level_report()
+        
+        # PHASE 37: Self-Reflection — Überwache eigene Gedanken
+        if self._self_reflection is not None:
+            prev_hidden = getattr(self, '_prev_hidden', None)
+            reflection = self._self_reflection(pred, output, prev_hidden=prev_hidden)
+            info_extra['reflection'] = reflection
+            self._prev_hidden = pred[:, -1:, :].detach()
+        
         return output, {'errors': errors, 'predictions': predictions, 'hidden': hidden, 'pred': pred, 'sparse': sparse_x, 'output': output, **info_extra}
 
     def learn(self, input_ids):
@@ -2330,6 +2527,12 @@ class CogLang:
                 self.ewc_snapshot_all()
             
             loss = F.cross_entropy(output.view(-1, output.size(-1)), input_ids.view(-1))
+            
+            # PHASE 37: Self-Reflection learn_step — lerne Selbsteinschätzung
+            if self._self_reflection is not None:
+                reflection = info.get('reflection')
+                if reflection:
+                    self._self_reflection.learn_step(reflection, loss.item())
             
             # PHASE 13b: EvolutionStrategy inline learn_step — Plateau-noise + Revert
             if self._es is not None and self._ewc_step_counter % 100 == 0:
@@ -2585,6 +2788,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.EvolutionStrategy(d_model=d_sparse, population_size=es_population, sigma=0.01)
     brain.SkillModule(d_model=d_sparse, n_skills=n_skills)
     brain.GoalEncoder(d_model=d_sparse, max_goal_len=50)
+    brain.SelfReflection(d_model=d_sparse)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

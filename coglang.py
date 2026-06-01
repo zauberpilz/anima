@@ -1016,6 +1016,7 @@ class EvolutionStrategyOptimizer(CogModule):
         self.sigma = sigma  # Perturbation noise
         self._best_weights = {}
         self._best_fitness = float('inf')
+        self._max_weight = 1.0  # clamp limit for perturbations
         
     def perturb_weights(self, model, seed=None):
         """Erstelle perturbierte Kopie der Gewichte."""
@@ -1373,6 +1374,10 @@ class CogLang:
         # PHASE 8: Apply neuro-symbolic rules to output
         if self._bridge is not None:
             output = self._bridge(output, context_embedding=sparse_x)
+        
+        # PHASE 14: SkillModule transformation - modulates output with skill-specific transforms
+        if self._skills is not None:
+            output = self._skills(output, context=sparse_x)
             
         return output, {'errors': errors, 'predictions': predictions, 'hidden': hidden, 'pred': pred, 'sparse': sparse_x, 'output': output}
 
@@ -1394,6 +1399,23 @@ class CogLang:
             if self._bridge is not None:
                 total_error = sum((e ** 2).mean(dim=-1, keepdim=True) for e in info['errors']) / len(info['errors'])
                 self._bridge.learn_step(info['sparse'], total_error)
+            
+            # PHASE 14: SkillModule learn_step - aktualisiert Skill-Prototypen basierend auf Error
+            if self._skills is not None:
+                total_error = sum((e ** 2).mean(dim=-1, keepdim=True) for e in info['errors']) / len(info['errors'])
+                self._skills.learn_step(info['sparse'], total_error)
+            
+            # PHASE 31: SecurityHead learn_step - selbstüberwacht aus Prediction Error
+            if self._security_head is not None and not hasattr(self, '_sec_counter'):
+                self._sec_counter = 0
+            if self._security_head is not None:
+                self._sec_counter += 1
+                if self._sec_counter % 500 == 0:  # Alle 500 Steps
+                    # Prediction Error als Pseudo-Anomalie-Signal
+                    pred_error = sum((e ** 2).mean(dim=1, keepdim=True) for e in info['errors']) / len(info['errors'])
+                    # High error = mögliche Anomalie (selbstüberwacht)
+                    anomaly_target = (pred_error > pred_error.median()).float()
+                    self._security_head.learn_step(info['sparse'], anomaly_target, pred_error)
             
             # PHASE 7: Intrinsic Motivation - compute curiosity reward
             if self._motivation is not None:

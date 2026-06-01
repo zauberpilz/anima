@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import os
 import threading
 import queue
+import re
 
 
 class CodeTokenizer:
@@ -2542,6 +2543,279 @@ class KnowledgeGraph(CogModule):
         }
 
 
+class ToolUse(CogModule):
+    """
+    PHASE 39: Tool Use — Externe Werkzeuge für CogLang.
+    
+    CogLang kann über spezielle Token-Patterns Werkzeuge aufrufen.
+    Das Modul parsed den generierten Text, erkennt Tool-Aufrufe,
+    führt sie aus und fügt Ergebnisse in den Kontext ein.
+    
+    Tools:
+    - calculator: Mathematische Ausdrücke auswerten
+    - python: Python-Code ausführen
+    - text_stats: Textstatistiken (Zeichen/Wörter/Zeilen)
+    - search: Web-Suche (Stub)
+    - tokenize: Token-Zerlegung anzeigen
+    """
+    def __init__(self, d_model, max_tool_history=64):
+        super().__init__()
+        self.d_model = d_model
+        self.max_tool_history = max_tool_history
+        
+        # ——— Tool Registry ———
+        self._tools = {}
+        self._register_default_tools()
+        
+        # ——— Tool-Call Embedding ———
+        # Lernt, welche Tools in welchem Kontext nützlich sind
+        self.tool_selector = nn.Linear(d_model, 16)  # 16 Tool-Typen
+        self.tool_embeddings = nn.Embedding(16, d_model)
+        
+        # ——— Tool-Result Fusion ———
+        # Webe Tool-Ergebnisse in Hidden-States ein
+        self.result_gate = nn.Linear(d_model * 2, d_model)
+        
+        # —── Tool-History Buffer ———
+        # Letzte N Tool-Aufrufe + Ergebnisse für Kontext
+        self.register_buffer('tool_history', torch.zeros(max_tool_history, 3, dtype=torch.long))
+        self.register_buffer('tool_history_idx', torch.zeros(1, dtype=torch.long))
+        
+        # ——— Metrik ———
+        self.register_buffer('tool_success_rate', torch.zeros(20))
+        self._success_idx = 0
+        self._exec_counter = 0
+        
+        # ——— Tool-Beschreibungen (für Logging) ———
+        self.tool_descriptions = {
+            'calculator': 'Berechne mathematischen Ausdruck. Args: expr (string)',
+            'python': 'Führe Python-Code aus. Args: code (string)',
+            'text_stats': 'Zeichen/Wörter/Zeilen zählen. Args: text (string)',
+            'search': 'Web-Suche (Stub). Args: query (string)',
+            'tokenize': 'Token-Zerlegung. Args: text (string)',
+        }
+    
+    def _register_default_tools(self):
+        """Registriere Standard-Werkzeuge."""
+        self.register_tool('calculator', self._tool_calculator,
+                           'Berechne mathematischen Ausdruck (z.B. "2 + 3 * 4")')
+        self.register_tool('python', self._tool_python,
+                           'Führe Python-Code aus und gib Ergebnis zurück')
+        self.register_tool('text_stats', self._tool_text_stats,
+                           'Zähle Zeichen, Wörter und Zeilen in Text')
+        self.register_tool('search', self._tool_search_stub,
+                           'Durchsuche das Web (Demo-Version)')
+        self.register_tool('tokenize', self._tool_tokenize,
+                           'Zerlege Text in Tokens')
+    
+    def register_tool(self, name, func, description=""):
+        """Registriere ein benutzerdefiniertes Werkzeug."""
+        self._tools[name] = {
+            'func': func,
+            'description': description,
+            'call_count': 0,
+            'success_count': 0,
+        }
+    
+    # ─── Tool-Implementierungen ─────────────────────────────────────
+    
+    def _tool_calculator(self, arg):
+        """Werte mathematischen Ausdruck aus (sicher)."""
+        try:
+            # Nur erlaubte Funktionen/Operatoren
+            allowed_names = {
+                k: v for k, v in math.__dict__.items()
+                if not k.startswith('_')
+            }
+            allowed_names.update({
+                'abs': abs, 'round': round, 'min': min, 'max': max,
+                'sum': sum, 'pow': pow, 'int': int, 'float': float,
+                'str': str, 'len': len,
+            })
+            # Entferne potenziell gefährliche Konstrukte
+            safe_arg = arg.strip().replace('\n', ' ')[:500]
+            result = eval(safe_arg, {"__builtins__": {}}, allowed_names)
+            return str(result)
+        except Exception as e:
+            return f"Error: {e}"
+    
+    def _tool_python(self, arg):
+        """Führe Python-Code aus (sandboxed, read-only)."""
+        self._exec_counter += 1
+        # Nur einfache Ausdrücke erlauben, kein Import/IO
+        forbidden = ['import ', 'open(', 'exec(', 'eval(', '__', 'os.', 'sys.', 'subprocess', 'shutil']
+        safe_arg = arg.strip()[:1000]
+        
+        for f in forbidden:
+            if f in safe_arg:
+                return f"Error: '{f}' nicht erlaubt"
+        
+        try:
+            # Versuche als Expression
+            result = eval(safe_arg, {"__builtins__": {}}, {})
+            return str(result)
+        except:
+            try:
+                # Versuche als Statement
+                local_vars = {}
+                exec(safe_arg, {"__builtins__": {}}, local_vars)
+                # Gib letzte definierte Variable zurück
+                if local_vars:
+                    return str(list(local_vars.values())[-1])
+                return "None"
+            except Exception as e:
+                return f"Error: {e}"
+    
+    def _tool_text_stats(self, arg):
+        """Zähle Zeichen, Wörter, Zeilen."""
+        s = arg[:5000]
+        return f"chars={len(s)} words={len(s.split())} lines={len(s.splitlines())}"
+    
+    def _tool_search_stub(self, arg):
+        """Web-Suche (Stub)."""
+        return f"[Search stub for '{arg[:100]}']"
+    
+    def _tool_tokenize(self, arg):
+        """Simuliere Token-Zerlegung (Wort-Level)."""
+        words = arg.strip().split()[:50]
+        tokens = [f"<{w}>" for w in words]
+        return f"[{', '.join(tokens)}]"
+    
+    # ─── Kern-Methoden ──────────────────────────────────────────────
+    
+    def detect_tool_calls(self, text):
+        """
+        Erkenne Tool-Aufrufe im generierten Text.
+        
+        Format: [TOOL:name:argument] oder TOOL(name, argument)
+        
+        Returns: list of (tool_name, argument)
+        """
+        calls = []
+        
+        # Pattern 1: [TOOL:name:arg]
+        pattern1 = r'\[TOOL:(\w+):(.*?)\]'
+        for match in re.finditer(pattern1, text):
+            name, arg = match.group(1), match.group(2)
+            if name in self._tools:
+                calls.append((name, arg.strip()))
+        
+        # Pattern 2: TOOL(name, arg)
+        pattern2 = r'TOOL\((\w+),\s*(.*?)\)'
+        for match in re.finditer(pattern2, text):
+            name, arg = match.group(1), match.group(2)
+            if name in self._tools:
+                calls.append((name, arg.strip().strip("'\"")))
+        
+        return calls
+    
+    def execute(self, tool_name, argument):
+        """
+        Führe ein Werkzeug aus.
+        
+        Args:
+            tool_name: str — Name des Werkzeugs
+            argument: str — Argument
+        
+        Returns:
+            result: str — Ergebnis
+            success: bool — Erfolg
+        """
+        if tool_name not in self._tools:
+            return f"Unknown tool: {tool_name}", False
+        
+        tool = self._tools[tool_name]
+        try:
+            result = tool['func'](argument)
+            tool['call_count'] += 1
+            tool['success_count'] += 1
+            
+            # Metrik aktualisieren
+            self.tool_success_rate[self._success_idx % 20] = 1.0
+            self._success_idx += 1
+            
+            return result, True
+        except Exception as e:
+            tool['call_count'] += 1
+            self.tool_success_rate[self._success_idx % 20] = 0.0
+            self._success_idx += 1
+            return f"Tool execution failed: {e}", False
+    
+    def condition(self, hidden_states, tool_context=None):
+        """
+        Moduliere Hidden-States mit Tool-Kontext.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            tool_context: dict oder None — Tool-Ergebnisse
+        
+        Returns:
+            modulated: [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            if tool_context is None or hidden_states.size(0) == 0:
+                return hidden_states
+            
+            batch, seq, d = hidden_states.shape
+            
+            # Tool-Embedding erzeugen
+            tool_id = self._name_to_id(tool_context.get('tool_name', 'calculator'))
+            tool_emb = self.tool_embeddings(torch.tensor([tool_id], device=hidden_states.device))
+            
+            # Gate: Tool-Embedding einweben
+            tool_expanded = tool_emb.unsqueeze(1).expand(batch, seq, -1)
+            gate_in = torch.cat([hidden_states, tool_expanded], dim=-1)
+            gate = torch.sigmoid(self.result_gate(gate_in))
+            
+            return hidden_states + gate * tool_expanded * 0.15
+    
+    def _name_to_id(self, name):
+        """Mappe Tool-Name auf ID (0-15)."""
+        mapping = {
+            'calculator': 0, 'python': 1, 'text_stats': 2,
+            'search': 3, 'tokenize': 4,
+        }
+        return mapping.get(name, 0)
+    
+    def learn_step(self, context_embedding, tool_calls, tool_results):
+        """
+        Lerne aus Tool-Nutzung.
+        
+        Args:
+            context_embedding: [batch, d_model] — Kontext vor Tool-Aufruf
+            tool_calls: list of (name, arg)
+            tool_results: list of (result, success)
+        """
+        with torch.no_grad():
+            if not tool_calls:
+                return
+            
+            for (name, arg), (result, success) in zip(tool_calls, tool_results):
+                tool_id = self._name_to_id(name)
+                
+                # Tool-Selector Update: verstärke Kontext→Tool-Mapping bei Erfolg
+                tool_logits = self.tool_selector(context_embedding.mean(dim=0, keepdim=True))
+                target = torch.zeros(1, 16, device=context_embedding.device)
+                target[0, tool_id] = 1.0 if success else 0.5
+                
+                # Hebbian-ähnlich
+                selector_error = target - torch.softmax(tool_logits, dim=-1)
+                self.tool_selector.weight.data += selector_error.T @ context_embedding.mean(dim=0, keepdim=True) * 0.001
+    
+    def get_tool_stats(self):
+        """Gib Tool-Statistiken zurück."""
+        stats = {}
+        for name, tool in self._tools.items():
+            stats[name] = {
+                'calls': tool['call_count'],
+                'successes': tool['success_count'],
+                'success_rate': (tool['success_count'] / max(1, tool['call_count'])),
+            }
+        stats['total_calls'] = sum(t['call_count'] for t in self._tools.values())
+        stats['success_rate_avg'] = self.tool_success_rate.mean().item()
+        return stats
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -2561,6 +2835,7 @@ class CogLang:
         self._goal_encoder = None
         self._self_reflection = None
         self._knowledge_graph = None
+        self._tool_use = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -2621,6 +2896,10 @@ class CogLang:
     def KnowledgeGraph(self, d_model, max_entities=1024, max_relations=64):
         """PHASE 38: Knowledge Graph — Explizites Weltwissen."""
         m = KnowledgeGraph(d_model, max_entities, max_relations); self.modules.append(m); self._knowledge_graph = m; return m
+    
+    def ToolUse(self, d_model, max_tool_history=64):
+        """PHASE 39: Tool Use — Externe Werkzeuge aufrufen."""
+        m = ToolUse(d_model, max_tool_history); self.modules.append(m); self._tool_use = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -2745,6 +3024,27 @@ class CogLang:
             reflection = self._self_reflection(pred, output, prev_hidden=prev_hidden)
             info_extra['reflection'] = reflection
             self._prev_hidden = pred[:, -1:, :].detach()
+        
+        # PHASE 39: Tool Use — Erkenne und führe Tool-Aufrufe aus
+        if self._tool_use is not None and not learn:
+            # Dekodiere Output in Text (grobe Approximation)
+            argmax_ids = output.argmax(dim=-1)  # [batch, seq]
+            tool_results = []
+            for b in range(argmax_ids.size(0)):
+                # Simuliere kurze Text-Dekodierung (nur für Tool-Erkennung)
+                text = " ".join([str(id.item()) for id in argmax_ids[b, -20:]])
+                calls = self._tool_use.detect_tool_calls(text)
+                for name, arg in calls:
+                    result, success = self._tool_use.execute(name, arg)
+                    tool_results.append({
+                        'tool': name, 'arg': arg, 'result': result, 'success': success
+                    })
+            if tool_results:
+                info_extra['tool_calls'] = tool_results
+                # Conditioniere mit Tool-Ergebnissen
+                tool_ctx = tool_results[-1] if tool_results else None
+                if tool_ctx:
+                    pred = self._tool_use.condition(pred, tool_ctx)
         
         return output, {'errors': errors, 'predictions': predictions, 'hidden': hidden, 'pred': pred, 'sparse': sparse_x, 'output': output, **info_extra}
 
@@ -3079,6 +3379,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.GoalEncoder(d_model=d_sparse, max_goal_len=50)
     brain.SelfReflection(d_model=d_sparse)
     brain.KnowledgeGraph(d_model=d_sparse, max_entities=1024, max_relations=64)
+    brain.ToolUse(d_model=d_sparse, max_tool_history=64)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

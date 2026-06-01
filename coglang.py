@@ -5087,6 +5087,520 @@ class MetaKognition(CogModule):
         }
 
 
+class HierarchicalMemory(CogModule):
+    """
+    PHASE 49: Hierarchical Memory — 5-Ebenen-Gedächtnishierarchie mit Konsolidierung.
+    
+    Ebenen:
+      L1 — Sensory Buffer:     Letzte 1000 Token-Eingaben (Rohdaten, flüchtig)
+      L2 — Working Memory:     Aktueller Kontext (256 Slots, temperature-basiertes Retrieval)
+      L3 — Episodic Buffer:    Wichtige Embeddings der letzten Iteration (500 Slots)
+      L4 — Semantic Network:   Abstrahiertes Wissen (koordiniert mit KnowledgeGraph)
+      L5 — Procedural Memory:  Gelernte Skills (koordiniert mit SkillModule)
+    
+    Konsolidierung (Sleep-Phase):
+      L1 → L2: Attention-Filtering (relevante Rohdaten → Working Memory)
+      L2 → L3: Importance-Based Promotion (wichtige Kontexte → Episodic Buffer)
+      L3 → L4: Pattern Abstraction (wiederholte Muster → Semantic Network)
+      L4 → L5: Skill Compilation (stabile Konzepte → Procedural Skills)
+    
+    Inspiriert vom hippocampal-neocorticalen Konsolidierungsmodell:
+    - Hippocampus (L2/L3): schnelle Enkodierung, temporärer Speicher
+    - Neocortex (L4/L5): langsame Extraktion, permanentes Wissen
+    """
+    def __init__(self, d_model, sensory_buffer_size=1000, working_mem_size=256,
+                 episodic_buffer_size=500, n_importance_bins=5):
+        super().__init__()
+        self.d_model = d_model
+        self.sensory_buffer_size = sensory_buffer_size
+        self.working_mem_size = working_mem_size
+        self.episodic_buffer_size = episodic_buffer_size
+        self.n_importance_bins = n_importance_bins
+        
+        # =====================================================================
+        #  L1 — SENSORY BUFFER
+        # =====================================================================
+        # Speichert Roh-Eingaben als (token_ids, embedding) Paare
+        self.register_buffer('sensory_tokens', torch.zeros(sensory_buffer_size, 128, dtype=torch.long))
+        self.register_buffer('sensory_embeddings', torch.zeros(sensory_buffer_size, d_model))
+        self.register_buffer('sensory_age', torch.zeros(sensory_buffer_size))
+        self.register_buffer('sensory_salience', torch.zeros(sensory_buffer_size))  # Wichtigkeit
+        self._sensory_idx = 0
+        
+        # ——— L1→L2 Attention Gate ———
+        # Berechnet Relevanz eines Sensory-Inputs für Working Memory
+        self.attention_gate = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.Tanh(),
+            nn.Linear(d_model // 2, 1),
+        )
+        
+        # =====================================================================
+        #  L2 — WORKING MEMORY (Enhanced)
+        # =====================================================================
+        # Erweiterte Version von EpisodicMemory (Phase 1) mit mehr Slots + Temp-Retrieval
+        self.register_buffer('working_memory', torch.zeros(working_mem_size, d_model))
+        self.register_buffer('working_age', torch.zeros(working_mem_size))
+        self.register_buffer('working_importance', torch.zeros(working_mem_size))
+        self.register_buffer('working_temperature', torch.tensor(1.0))  # Retrieval-Temp
+        
+        # Hebbian Write/Read
+        self.wm_write = nn.Linear(d_model, working_mem_size, bias=False)
+        self.wm_read = nn.Linear(working_mem_size, d_model, bias=False)
+        self.wm_proj = nn.Linear(d_model, d_model, bias=False)
+        self._max_weight = 2.0
+        
+        # =====================================================================
+        #  L3 — EPISODIC BUFFER (Mid-Term)
+        # =====================================================================
+        # Wichtige Embeddings, die über mehrere Iterationen erhalten bleiben
+        self.register_buffer('episodic_buffer', torch.zeros(episodic_buffer_size, d_model))
+        self.register_buffer('episodic_age', torch.zeros(episodic_buffer_size))
+        self.register_buffer('episodic_importance', torch.zeros(episodic_buffer_size))
+        self.register_buffer('episodic_consolidation_count', torch.zeros(episodic_buffer_size))
+        self.register_buffer('episodic_domain', torch.zeros(episodic_buffer_size, dtype=torch.long))
+        self._episodic_idx = 0
+        
+        # ——— L2→L3 Importance Scorer ———
+        self.importance_scorer = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.ReLU(),
+            nn.Linear(d_model // 4, n_importance_bins),
+        )
+        
+        # =====================================================================
+        #  L4 — Semantic Abstraction Gate
+        # =====================================================================
+        # Extrahiert wiederholte Patterns aus Episodic → konzeptuelle Embeddings
+        self.semantic_abstraction = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.Tanh(),
+            nn.Linear(d_model // 2, d_model),
+        )
+        
+        # Pattern-Detection: Cos-Ähnlichkeit zwischen episodischen Embeddings
+        self.register_buffer('pattern_similarity_threshold', torch.tensor(0.85))
+        
+        # =====================================================================
+        #  L5 — Procedural Compilation Gate
+        # =====================================================================
+        # Destilliert stabile semantische Konzepte → Skill-ähnliche Vektoren
+        self.procedural_compilation = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.Tanh(),
+            nn.Linear(d_model // 2, d_model),
+        )
+        self.register_buffer('compiled_skills', torch.zeros(8, d_model))  # Max 8 compiled skills
+        self._skill_compile_idx = 0
+        
+        # =====================================================================
+        #  Metrik-Tracking
+        # =====================================================================
+        self.register_buffer('consolidation_stats', torch.zeros(10))  # Letzte 10 Konsolidierungs-Runs
+        self._consolidation_idx = 0
+        
+        # Externe Referenzen (werden von CogLang gesetzt)
+        self._knowledge_graph = None
+        self._skill_module = None
+        
+        self._max_weight = 2.0
+    
+    def link_modules(self, knowledge_graph=None, skill_module=None):
+        """Verbinde mit bestehenden CogLang-Modulen."""
+        self._knowledge_graph = knowledge_graph
+        self._skill_module = skill_module
+    
+    # =========================================================================
+    #  L1 — SENSORY BUFFER
+    # =========================================================================
+    
+    def store_sensory(self, token_ids, embedding):
+        """
+        Speichere Roh-Eingabe im Sensory Buffer.
+        
+        Args:
+            token_ids: [batch, seq] — Input-Token
+            embedding: [batch, seq, d_model] — Encodierte Embeddings
+        """
+        with torch.no_grad():
+            batch = token_ids.size(0)
+            for b in range(batch):
+                idx = self._sensory_idx % self.sensory_buffer_size
+                
+                # Speichere Tokens (max 128)
+                seq_len = min(token_ids.size(1), 128)
+                self.sensory_tokens[idx, :seq_len] = token_ids[b, :seq_len].to(dtype=torch.long)
+                
+                # Speichere gemitteltes Embedding
+                emb_mean = embedding[b].mean(dim=0)  # [d_model]
+                self.sensory_embeddings[idx] = emb_mean
+                
+                # Berechne Salience (vorläufig: uniform)
+                self.sensory_salience[idx] = 1.0
+                self.sensory_age[idx] = 0
+                
+                self._sensory_idx += 1
+    
+    def attend_sensory_to_working(self, top_k=16):
+        """
+        L1 → L2: Aufmerksamkeitsgesteuerte Promotion in Working Memory.
+        
+        Wählt die top_k salientesten Sensory-Inputs aus und schreibt sie
+        in den Working Memory.
+        """
+        with torch.no_grad():
+            n_valid = min(self._sensory_idx, self.sensory_buffer_size)
+            if n_valid < 4:
+                return
+            
+            # Verfügbare Embeddings
+            embeddings = self.sensory_embeddings[:n_valid]  # [n, d_model]
+            
+            # Berechne Salience via Attention Gate
+            salience = torch.sigmoid(self.attention_gate(embeddings)).squeeze(-1)  # [n]
+            
+            # Mische mit bestehender Sensory-Salience
+            salience = 0.7 * salience + 0.3 * self.sensory_salience[:n_valid]
+            
+            # Wähle top_k
+            _, top_idx = torch.topk(salience, min(top_k, n_valid))
+            
+            # Schreibe in Working Memory
+            for idx in top_idx:
+                emb = embeddings[idx]
+                self._write_working_memory(emb)
+    
+    # =========================================================================
+    #  L2 — WORKING MEMORY
+    # =========================================================================
+    
+    def retrieve_working(self, query, temperature=None):
+        """
+        Content-Addressable Retrieval aus Working Memory.
+        
+        Args:
+            query: [batch, seq, d_model] — Query-Embedding
+            temperature: float oder None — Retrieval-Temp (niedriger = schärfer)
+            
+        Returns:
+            retrieved: [batch, seq, d_model] — Abgerufene Memory-Inhalte
+        """
+        with torch.no_grad():
+            batch, seq, d = query.shape
+            temp = temperature if temperature is not None else self.working_temperature.item()
+            
+            q_flat = query.reshape(-1, d)  # [batch*seq, d]
+            
+            # Cosine-Ähnlichkeit
+            q_norm = F.normalize(q_flat, dim=-1)
+            m_norm = F.normalize(self.working_memory, dim=-1)  # [wm_size, d]
+            similarity = q_norm @ m_norm.T  # [batch*seq, wm_size]
+            
+            # Temperature-Scaled Attention
+            attention = F.softmax(similarity / max(temp, 0.1), dim=-1)
+            
+            # Retrieve
+            retrieved = attention @ self.working_memory  # [batch*seq, d]
+            retrieved = retrieved.reshape(batch, seq, d)
+            
+            # Projektion
+            retrieved = self.wm_proj(retrieved)
+            
+            return retrieved
+    
+    def _write_working_memory(self, state, importance=1.0):
+        """Schreibe einen State in den Working Memory (ältester Slot)."""
+        with torch.no_grad():
+            # Finde ältesten Slot
+            oldest_idx = torch.argmax(self.working_age)
+            
+            self.working_memory[oldest_idx] = state.detach()
+            self.working_age[oldest_idx] = 0
+            self.working_importance[oldest_idx] = importance
+            
+            # Alter aller Slots erhöhen
+            self.working_age += 1
+            self.working_age = self.working_age.clamp(0, 1000)
+    
+    def compute_importance(self, embedding, error_norm=None):
+        """
+        Berechne Importance eines Embeddings für L2→L3 Promotion.
+        
+        Args:
+            embedding: [d_model] — State-Embedding
+            error_norm: float oder None — Prediction Error (höher = wichtiger)
+            
+        Returns:
+            importance_score: float (0..1)
+            importance_bin: int (0..n_importance_bins-1)
+        """
+        with torch.no_grad():
+            # Features: Embedding + Error
+            feat = embedding.unsqueeze(0)  # [1, d_model]
+            
+            # Importance via Scorer
+            raw = self.importance_scorer(feat)  # [1, n_bins]
+            probs = F.softmax(raw, dim=-1)
+            
+            # Gewichtete Summe der Bins
+            bin_weights = torch.arange(self.n_importance_bins, device=raw.device).float()
+            importance = (probs * bin_weights).sum().item() / (self.n_importance_bins - 1)
+            
+            # Error-Boost: höherer Prediction Error = höhere Importance
+            if error_norm is not None:
+                error_factor = min(error_norm, 5.0) / 5.0  # Normalisiert auf 0..1
+                importance = 0.6 * importance + 0.4 * error_factor
+            
+            importance = max(0.0, min(1.0, importance))
+            bin_idx = min(int(importance * self.n_importance_bins), self.n_importance_bins - 1)
+            
+            return importance, bin_idx
+    
+    # =========================================================================
+    #  L3 — EPISODIC BUFFER
+    # =========================================================================
+    
+    def promote_to_episodic(self, embedding, importance, domain_idx=0):
+        """
+        L2 → L3: Promotion eines Working-Memory-States in den Episodic Buffer.
+        Nur States mit hoher Importance werden übernommen.
+        """
+        with torch.no_grad():
+            if importance < 0.3:
+                return False  # Zu unwichtig
+            
+            idx = self._episodic_idx % self.episodic_buffer_size
+            self.episodic_buffer[idx] = embedding.detach()
+            self.episodic_age[idx] = 0
+            self.episodic_importance[idx] = importance
+            self.episodic_domain[idx] = domain_idx
+            self.episodic_consolidation_count[idx] = 1
+            
+            self._episodic_idx += 1
+            return True
+    
+    def retrieve_episodic(self, query, top_k=5):
+        """
+        Retrieval aus Episodic Buffer (gewichtete Cos-Ähnlichkeit).
+        
+        Args:
+            query: [batch, seq, d_model]
+            top_k: int
+            
+        Returns:
+            episodes: [batch, seq, d_model] — Gewichtete Summe der Top-K
+            scores: [top_k] — Ähnlichkeits-Scores
+        """
+        with torch.no_grad():
+            batch, seq, d = query.shape
+            n_valid = min(self._episodic_idx, self.episodic_buffer_size)
+            if n_valid < 1:
+                return torch.zeros_like(query), torch.zeros(0)
+            
+            q_flat = query.reshape(-1, d)  # [batch*seq, d]
+            q_norm = F.normalize(q_flat, dim=-1)
+            e_norm = F.normalize(self.episodic_buffer[:n_valid], dim=-1)  # [n, d]
+            
+            # Cos-Ähnlichkeit
+            sim = q_norm @ e_norm.T  # [batch*seq, n]
+            
+            # Gewichte mit Importance
+            imp = self.episodic_importance[:n_valid].unsqueeze(0)  # [1, n]
+            weighted_sim = sim * imp  # [batch*seq, n]
+            
+            # Top-K
+            top_scores, top_idx = torch.topk(weighted_sim, min(top_k, n_valid), dim=-1)
+            
+            # Retrieve
+            retrieved = torch.zeros(batch * seq, d, device=query.device)
+            for i in range(batch * seq):
+                weights = F.softmax(top_scores[i], dim=-1)  # [top_k]
+                retrieved[i] = (self.episodic_buffer[top_idx[i]] * weights.unsqueeze(-1)).sum(dim=0)
+            
+            retrieved = retrieved.reshape(batch, seq, d)
+            
+            return retrieved, top_scores
+    
+    # =========================================================================
+    #  L4 → L5 — CONSOLIDATION (Sleep-Phase)
+    # =========================================================================
+    
+    def consolidate(self, n_cycles=3):
+        """
+        Führe vollständige Konsolidierung durch alle Hierarchie-Ebenen aus.
+        
+        Returns:
+            report: dict mit Konsolidierungs-Statistiken
+        """
+        with torch.no_grad():
+            report = {
+                'sensory_to_working': 0,
+                'working_to_episodic': 0,
+                'patterns_found': 0,
+                'skills_compiled': 0,
+                'consolidation_cycle': self._consolidation_idx,
+            }
+            
+            for cycle in range(n_cycles):
+                # ——— L1 → L2: Sensory → Working ———
+                self.attend_sensory_to_working(top_k=16)
+                report['sensory_to_working'] += 16
+                
+                # ——— L2 → L3: Working → Episodic ———
+                n_wm = min(self.working_mem_size, 256)
+                promo_count = 0
+                for i in range(n_wm):
+                    emb = self.working_memory[i]
+                    imp, _ = self.compute_importance(emb)
+                    if imp > 0.4:
+                        success = self.promote_to_episodic(emb, imp)
+                        if success:
+                            promo_count += 1
+                
+                report['working_to_episodic'] += promo_count
+                
+                # ——— L3 → L4: Pattern Detection (Semantic Abstraction) ———
+                n_ep = min(self._episodic_idx, self.episodic_buffer_size)
+                if n_ep > 10:
+                    # Finde wiederholte Patterns via Clustering-Ähnlichkeit
+                    embeddings = self.episodic_buffer[:n_ep]  # [n, d]
+                    norms = F.normalize(embeddings, dim=-1)
+                    
+                    # Pairwise Cos-Ähnlichkeit
+                    sim_matrix = norms @ norms.T  # [n, n]
+                    
+                    # Finde ähnliche Paare (oberes Dreieck)
+                    mask = torch.triu(torch.ones(n_ep, n_ep, device=sim_matrix.device), diagonal=1)
+                    paired_sim = sim_matrix * mask
+                    
+                    similar_pairs = (paired_sim > self.pattern_similarity_threshold).nonzero()
+                    
+                    for pair in similar_pairs[:5]:  # Max 5 Patterns pro Cycle
+                        i, j = pair[0].item(), pair[1].item()
+                        
+                        # Abstrahiere gemeinsames Pattern
+                        pattern = (embeddings[i] + embeddings[j]) / 2.0
+                        abstracted = self.semantic_abstraction(pattern.unsqueeze(0)).squeeze(0)
+                        
+                        # Wenn KnowledgeGraph verfügbar: speichere als neue Entität
+                        if self._knowledge_graph is not None:
+                            self._knowledge_graph.add_entity(name=f"pattern_{cycle}_{i}")
+                        
+                        report['patterns_found'] += 1
+                
+                # ——— L4 → L5: Procedural Compilation ———
+                # Destilliere stabile Patterns in Skills
+                if report['patterns_found'] > 0 and report['patterns_found'] > report['skills_compiled']:
+                    # Wähle neueste Patterns zur Kompilierung
+                    for _ in range(min(2, report['patterns_found'])):
+                        if self._skill_compile_idx < 8:
+                            # Verwende Durchschnitt der letzten Episodic-Embeddings
+                            if n_ep > 0:
+                                recent = self.episodic_buffer[max(0, n_ep-10):n_ep].mean(dim=0)
+                                compiled = self.procedural_compilation(recent.unsqueeze(0)).squeeze(0)
+                                self.compiled_skills[self._skill_compile_idx] = compiled
+                                self._skill_compile_idx += 1
+                                report['skills_compiled'] += 1
+                
+                # Alter aller Ebenen erhöhen (Vergessen)
+                self.sensory_age += 1
+                self.working_age += 1
+                self.episodic_age += 1
+            
+            # Statistik
+            self.consolidation_stats[self._consolidation_idx % 10] = (
+                report['patterns_found'] + report['skills_compiled'] * 0.5
+            )
+            self._consolidation_idx += 1
+            
+            return report
+    
+    # =========================================================================
+    #  FORWARD — Retrieval aus allen Ebenen
+    # =========================================================================
+    
+    def forward(self, query, retrieve_levels=None):
+        """
+        Führe hierarchisches Memory-Retrieval durch.
+        
+        Args:
+            query: [batch, seq, d_model] — Query-Embedding
+            retrieve_levels: list von Level-Namen oder None (alle)
+                           ['working', 'episodic', 'semantic', 'procedural']
+            
+        Returns:
+            result: dict mit level -> retrieved_embedding
+        """
+        with torch.no_grad():
+            if retrieve_levels is None:
+                retrieve_levels = ['working', 'episodic']
+            
+            result = {}
+            
+            # L2 — Working Memory Retrieval
+            if 'working' in retrieve_levels:
+                wm_retrieved = self.retrieve_working(query)
+                result['working'] = wm_retrieved
+            
+            # L3 — Episodic Buffer Retrieval
+            if 'episodic' in retrieve_levels:
+                ep_retrieved, ep_scores = self.retrieve_episodic(query)
+                result['episodic'] = ep_retrieved
+                result['episodic_scores'] = ep_scores
+            
+            # L4 — Semantic (via KnowledgeGraph)
+            if 'semantic' in retrieve_levels and self._knowledge_graph is not None:
+                ctx_pooled = query.mean(dim=1)
+                knowledge = self._knowledge_graph.retrieve(ctx_pooled, top_k=3)
+                result['semantic'] = knowledge
+            
+            # L5 — Procedural (via compiled skills)
+            if 'procedural' in retrieve_levels:
+                # Cos-Ähnlichkeit zwischen Query und Compiled Skills
+                q_pooled = query.mean(dim=1)
+                q_norm = F.normalize(q_pooled, dim=-1)
+                s_norm = F.normalize(self.compiled_skills, dim=-1)
+                
+                n_compiled = min(self._skill_compile_idx, 8)
+                if n_compiled > 0:
+                    sim = q_norm @ s_norm[:n_compiled].T  # [batch, n_compiled]
+                    weights = F.softmax(sim / 0.5, dim=-1)  # [batch, n_compiled]
+                    
+                    # Gewichtete Summe
+                    proc_retrieved = weights @ self.compiled_skills[:n_compiled]  # [batch, d]
+                    proc_retrieved = proc_retrieved.unsqueeze(1).expand(-1, query.size(1), -1)
+                    result['procedural'] = proc_retrieved
+                else:
+                    result['procedural'] = torch.zeros_like(query)
+            
+            return result
+    
+    def get_memory_stats(self):
+        """Gib Hierarchie-Gedächtnis-Statistiken."""
+        n_sensory = min(self._sensory_idx, self.sensory_buffer_size)
+        n_wm = int((self.working_age < 1000).sum().item())
+        n_ep = min(self._episodic_idx, self.episodic_buffer_size)
+        
+        # Durchschnittliche Importance
+        avg_wm_imp = self.working_importance[:n_wm].mean().item() if n_wm > 0 else 0.0
+        avg_ep_imp = self.episodic_importance[:n_ep].mean().item() if n_ep > 0 else 0.0
+        
+        # Konsolidierungs-Qualität
+        avg_consol = self.consolidation_stats[:max(1, self._consolidation_idx)].mean().item()
+        
+        return {
+            'sensory_usage': n_sensory,
+            'working_usage': n_wm,
+            'episodic_usage': n_ep,
+            'compiled_skills': min(self._skill_compile_idx, 8),
+            'avg_wm_importance': avg_wm_imp,
+            'avg_ep_importance': avg_ep_imp,
+            'consolidation_quality': avg_consol,
+            'pattern_threshold': self.pattern_similarity_threshold.item(),
+            'retrieval_temperature': self.working_temperature.item(),
+        }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -5116,6 +5630,7 @@ class CogLang:
         self._imagination = None
         self._exploration = None
         self._metakognition = None
+        self._hierarchical_memory = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -5217,6 +5732,13 @@ class CogLang:
         """PHASE 48: MetaKognition — Strategie-Selektion, Confidence-Kalibrierung, Resource-Allocation."""
         m = MetaKognition(d_model, n_strategies, n_resource_levels); self.modules.append(m); self._metakognition = m; return m
 
+    def HierarchicalMemory(self, d_model, sensory_buffer_size=1000, working_mem_size=256, episodic_buffer_size=500):
+        """PHASE 49: Hierarchical Memory — 5-Ebenen-Gedächtnishierarchie mit Konsolidierung."""
+        m = HierarchicalMemory(d_model, sensory_buffer_size, working_mem_size, episodic_buffer_size)
+        self.modules.append(m)
+        self._hierarchical_memory = m
+        return m
+
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
         m = SecurityHead(d_model, d_sparse, n_cwe_types)
@@ -5278,6 +5800,10 @@ class CogLang:
         x = self._sensory(input_ids)
         sparse_x = self._encoder(x)
         
+        # PHASE 49: Hierarchical Memory — Speichere Sensory Input
+        if self._hierarchical_memory is not None:
+            self._hierarchical_memory.store_sensory(input_ids, sparse_x)
+        
         if self._context_embed is None:
             d_context = self._stack.layers[0].d_context
             ce = nn.Embedding(8192, d_context).to(device)
@@ -5332,6 +5858,20 @@ class CogLang:
                     'n_facts': knowledge['n_facts'],
                     'graph_stats': self._knowledge_graph.get_graph_stats(),
                 }
+        
+        # PHASE 49: Hierarchical Memory — Retrieve aus Gedächtnishierarchie
+        if self._hierarchical_memory is not None:
+            # Link zu Knowledge Graph und Skills falls vorhanden
+            self._hierarchical_memory.link_modules(
+                knowledge_graph=self._knowledge_graph,
+                skill_module=self._skills,
+            )
+            # Retrieve aus Working + Episodic Memory
+            mem_result = self._hierarchical_memory.retrieve_working(pred)
+            pred = pred + mem_result * 0.05  # Sanfter Memory-Einfluss
+            info_extra['hierarchical_memory'] = {
+                'retrieved': True,
+            }
         
         # PHASE 40: Multi-Agent Self-Play — Perspektivenvielfalt
         if self._multi_agent is not None and not learn:
@@ -5549,6 +6089,15 @@ class CogLang:
                 err_norm = sum((e ** 2).mean().item() for e in info['errors']) / max(1, len(info['errors']))
                 self._exploration.update_uncertainty(info['pred'], err_norm)
             
+            # PHASE 49: Hierarchical Memory — Promote Working → Episodic
+            if self._hierarchical_memory is not None and info.get('pred') is not None:
+                err_norm = sum((e ** 2).mean().item() for e in info['errors']) / max(1, len(info['errors']))
+                # Promote ersten Batch-State zu Episodic
+                state = info['pred'][0, -1, :]  # [d_sparse]
+                importance, _ = self._hierarchical_memory.compute_importance(state, err_norm)
+                domain_idx = getattr(self, '_current_domain', 0)
+                self._hierarchical_memory.promote_to_episodic(state, importance, domain_idx)
+            
             # PHASE 33: Active Inference — Curiosity + Free Energy + Epistemic Value
             if self._active_inference is not None:
                 # Use first layer error for observation
@@ -5663,10 +6212,14 @@ class CogLang:
 
     def run_sleep_phase(self, n_steps=100, device='cuda'):
         """PHASE 34: Führe Sleep-Phase zur Konsolidierung aus."""
+        report = {}
         if self._sleep_replay is not None:
             report = self._sleep_replay.sleep_phase(self, n_steps=n_steps, device=device)
-            return report
-        return {}
+        # PHASE 49: Hierarchical Memory Konsolidierung
+        if self._hierarchical_memory is not None:
+            consol_report = self._hierarchical_memory.consolidate(n_cycles=3)
+            report['hierarchical'] = consol_report
+        return report
     
     def get_active_inference_report(self):
         """PHASE 33: Gib aktuelles Active Inference Report zurück."""
@@ -5913,6 +6466,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.ImaginationPlanning(d_model=d_sparse, n_plan_steps=6, n_actions=16, temperature=0.2)
     brain.ExplorationDrive(d_model=d_sparse, n_uncertainty_cells=128, n_emn_history=200)
     brain.MetaKognition(d_model=d_sparse, n_strategies=4, n_resource_levels=3)
+    brain.HierarchicalMemory(d_model=d_sparse, sensory_buffer_size=1000, working_mem_size=256, episodic_buffer_size=500)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

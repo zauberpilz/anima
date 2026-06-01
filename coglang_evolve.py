@@ -868,6 +868,8 @@ def run_evolution():
                             'exploration': brain._exploration.get_exploration_stats() if hasattr(brain, '_exploration') and brain._exploration is not None else {},
                             # PHASE 48: MetaKognition Stats
                             'metakognition': brain._metakognition.get_metakognition_stats() if hasattr(brain, '_metakognition') and brain._metakognition is not None else {},
+                            # PHASE 49: Hierarchical Memory Stats
+                            'hierarchical_memory': brain._hierarchical_memory.get_memory_stats() if hasattr(brain, '_hierarchical_memory') and brain._hierarchical_memory is not None else {},
                         }
                         with open('/home/anima/train_state.json', 'w') as sf:
                             json.dump(state, sf)

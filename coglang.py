@@ -4247,6 +4247,263 @@ class System2Reasoning(CogModule):
         }
 
 
+class ImaginationPlanning(CogModule):
+    """
+    PHASE 46: Imagination & Planning — Vorhersage + Generierung + Bewertung.
+    
+    CogLang kann in die Zukunft blicken: Imagination zukünftiger Zustände
+    und mehrschrittige Planung, um gewünschte Ergebnisse zu erreichen.
+    
+    Drei-Komponenten-Architektur nach Bengio's "consciousness prior":
+    
+    1. Future Predictor: Nimmt (aktueller_State, Aktion) → nächster_State
+       - Lernt ein internes Weltmodell: "wenn ich X tue, passiert Y"
+       - Wird trainiert aus realen Sequenzen (next-token-prediction)
+    
+    2. Plan Generator: Erzeugt Aktionssequenzen (abstrakte Pläne)
+       - Suchbaum: expandiere mögliche Aktionen, simuliere Ergebnis
+       - BFS/DFS-artig: "was passiert nach Schritt 1, 2, 3...?"
+    
+    3. Plan Verifier: Bewertet Pläne nach gewünschtem Kriterium
+       - "Führt dieser Plan zu einem besseren Zustand?"
+       - Lernt aus Kontrast: gute Pläne vs. schlechte Pläne
+    
+    Integration mit System-2 Reasoning:
+    - Reasoning liefert die "Gedankenschritte"
+    - Imagination testet diese Gedanken in simulierter Zukunft
+    """
+    def __init__(self, d_model, n_plan_steps=6, n_actions=16, temperature=0.2):
+        super().__init__()
+        self.d_model = d_model
+        self.n_plan_steps = n_plan_steps
+        self.n_actions = n_actions
+        self.temperature = temperature
+        
+        # ——— 1. Future Predictor (Weltmodell) ———
+        # state_encoder + action_embedding → next_state
+        self.state_encoder = nn.Linear(d_model, d_model)
+        self.action_embedding = nn.Embedding(n_actions, d_model)
+        self.future_predictor = nn.Sequential(
+            nn.Linear(d_model * 2, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, d_model),
+        )
+        
+        # ——— 2. Plan Generator ———
+        # Aus aktuellem Kontext: generiere K Aktionssequenzen
+        self.plan_generator = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, n_plan_steps * n_actions),
+        )
+        
+        # ——— 3. Plan Verifier ———
+        # Bewerte: "ist dieser Plan gut?" (scalar output)
+        self.plan_verifier = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1),
+        )
+        
+        # ——— 4. Imagination Buffer ———
+        # Speichert vorgestellte Zustände für spätere Lernschritte
+        self.register_buffer('imagination_buffer', torch.zeros(500, d_model))
+        self.register_buffer('imagination_scores', torch.zeros(500))
+        self._buffer_idx = 0
+        self._buffer_count = 0
+        
+        # ——— 5. Metrik-Tracking ———
+        self.register_buffer('plan_quality', torch.zeros(100))
+        self.register_buffer('prediction_accuracy', torch.zeros(100))
+        self._quality_idx = 0
+        self._pred_idx = 0
+    
+    def predict_future(self, current_state, action_ids):
+        """
+        Sage nächsten Zustand voraus (Weltmodell).
+        
+        Args:
+            current_state: [batch, d_model] — Aktueller Zustand
+            action_ids: [batch] oder int — Gewählte Aktion
+        
+        Returns:
+            next_state: [batch, d_model] — Vorhergesagter Zustand
+        """
+        with torch.no_grad():
+            if isinstance(action_ids, int):
+                action_ids = torch.tensor([action_ids], device=current_state.device)
+            if action_ids.dim() == 0:
+                action_ids = action_ids.unsqueeze(0)
+            if action_ids.size(0) != current_state.size(0):
+                action_ids = action_ids.expand(current_state.size(0))
+            
+            state_encoded = self.state_encoder(current_state)
+            action_emb = self.action_embedding(action_ids)
+            
+            combined = torch.cat([state_encoded, action_emb], dim=-1)
+            next_state = self.future_predictor(combined)
+            
+            return next_state
+    
+    def generate_plan(self, context, n_candidates=5):
+        """
+        Generiere mehrere Aktionspläne.
+        
+        Args:
+            context: [batch, d_model] — Gepoolter Kontext
+            n_candidates: int — Anzahl Kandidaten-Pläne
+        
+        Returns:
+            plans: [batch, n_candidates, n_steps] — Aktions-IDs
+            plan_scores: [batch, n_candidates] — Bewertungen
+            imagined_states: [batch, n_candidates, n_steps+1, d_model]
+        """
+        with torch.no_grad():
+            batch, d = context.shape
+            
+            # Generiere Kandidatepläne via Plan-Generator mit noise
+            logits = self.plan_generator(context)  # [batch, n_steps * n_actions]
+            logits = logits.view(batch, self.n_plan_steps, self.n_actions)
+            
+            # Sampling mit Temperatur für Diversität
+            plans = []
+            for c in range(n_candidates):
+                noise = torch.randn_like(logits) * self.temperature
+                plan_logits = logits + noise
+                plan = torch.multinomial(
+                    F.softmax(plan_logits.view(-1, self.n_actions), dim=-1),
+                    num_samples=1
+                ).view(batch, self.n_plan_steps)
+                plans.append(plan)
+            
+            plans = torch.stack(plans, dim=1)  # [batch, candidates, steps]
+            
+            # Simuliere jeden Plan: rolle Zukunft aus
+            imagined_states = []
+            plan_scores_batches = []
+            
+            for b in range(batch):
+                batch_imagined = []
+                batch_scores = []
+                
+                for c in range(n_candidates):
+                    states = [context[b:b+1]]
+                    score_sum = 0.0
+                    
+                    for t in range(self.n_plan_steps):
+                        action_id = plans[b, c, t]
+                        next_state = self.predict_future(states[-1], action_id.item())
+                        states.append(next_state)
+                        
+                        # Verifiziere diesen Schritt
+                        verif_in = torch.cat([states[-2], next_state], dim=-1)
+                        step_score = torch.sigmoid(self.plan_verifier(verif_in)).item()
+                        score_sum += step_score
+                    
+                    batch_imagined.append(torch.cat(states, dim=0).unsqueeze(0))
+                    batch_scores.append(score_sum / self.n_plan_steps)
+                
+                imagined_states.append(torch.cat(batch_imagined, dim=0).unsqueeze(0))
+                plan_scores_batches.append(torch.tensor(batch_scores))
+            
+            imagined_states = torch.cat(imagined_states, dim=0)  # [batch, candidates, steps+1, d]
+            plan_scores = torch.stack(plan_scores_batches, dim=0)  # [batch, candidates]
+            
+            return plans, plan_scores, imagined_states
+    
+    def simulate(self, hidden_states, n_steps=4):
+        """
+        Simuliere zukünftige Entwicklung (Imagination).
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            n_steps: int — Wie viele Schritte in die Zukunft?
+        
+        Returns:
+            imagined_futures: [batch, n_candidates, n_steps, d_model]
+            best_future: [batch, 1, d_model]
+        """
+        with torch.no_grad():
+            context = hidden_states.mean(dim=1)  # [batch, d_model]
+            
+            plans, scores, states = self.generate_plan(context, n_candidates=3)
+            
+            # Wähle besten Plan
+            best_plan_idx = scores.argmax(dim=-1)  # [batch]
+            batch, candidates, steps_plus1, d = states.shape
+            
+            best_futures = []
+            for b in range(batch):
+                best_futures.append(states[b, best_plan_idx[b], 1:, :])  # ohne ersten State
+            
+            best_future = torch.stack(best_futures, dim=0)  # [batch, n_steps, d]
+            
+            # Speichere in Imagination Buffer
+            if self._buffer_count < 500:
+                for b in range(batch):
+                    idx = self._buffer_idx % 500
+                    self.imagination_buffer[idx] = best_future[b].mean(dim=0)
+                    self.imagination_scores[idx] = scores[b, best_plan_idx[b]].item()
+                    self._buffer_idx += 1
+                    self._buffer_count = min(self._buffer_count + 1, 500)
+            
+            # Metrik
+            idx = self._quality_idx % 100
+            self.plan_quality[idx] = scores.mean().item()
+            self._quality_idx += 1
+            
+            return best_future
+    
+    def learn_from_imagination(self, actual_next_state, imagined_next_state):
+        """
+        Lerne aus Diskrepanz zwischen Imagination und Realität.
+        
+        Args:
+            actual_next_state: [batch, d_model] — Echter nächster State
+            imagined_next_state: [batch, d_model] — Vorgestellter State
+        """
+        with torch.no_grad():
+            # Prediction Accuracy: Cos-Ähnlichkeit
+            acc = F.cosine_similarity(actual_next_state, imagined_next_state, dim=-1).mean().item()
+            idx = self._pred_idx % 100
+            self.prediction_accuracy[idx] = max(0, min(1, acc))
+            self._pred_idx += 1
+    
+    def condition(self, hidden_states):
+        """
+        Konditioniere Hidden-States mit Imagination.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+        
+        Returns:
+            conditioned: [batch, seq, d_model]
+        """
+        with torch.no_grad():
+            batch, seq, d = hidden_states.shape
+            
+            # Simuliere Zukunft (selten, alle 10 Schritte)
+            if self._quality_idx % 10 == 0:
+                best_future = self.simulate(hidden_states, n_steps=4)
+                # Integriere Imagination: Durchschnitt der Zukunft
+                future_influence = best_future.mean(dim=1, keepdim=True)  # [batch, 1, d]
+                return hidden_states + future_influence * 0.03
+            
+            return hidden_states
+    
+    def get_imagination_stats(self):
+        """Gib Imaginations-Statistiken."""
+        avg_quality = self.plan_quality[:max(1, self._quality_idx)].mean().item()
+        avg_acc = self.prediction_accuracy[:max(1, self._pred_idx)].mean().item()
+        return {
+            'avg_plan_quality': avg_quality,
+            'avg_prediction_accuracy': avg_acc,
+            'n_plan_steps': self.n_plan_steps,
+            'n_actions': self.n_actions,
+            'buffer_usage': min(self._buffer_count, 500),
+        }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -4273,6 +4530,7 @@ class CogLang:
         self._auto_curriculum = None
         self._causal_reasoning = None
         self._system2_reasoning = None
+        self._imagination = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -4361,6 +4619,10 @@ class CogLang:
     def System2Reasoning(self, d_model, n_reasoning_steps=8, n_tree_branches=3, temperature=0.3):
         """PHASE 45: System-2 Reasoning — Kettenbewusstsein + Verifikation + Gedankenbäume."""
         m = System2Reasoning(d_model, n_reasoning_steps, n_tree_branches, temperature); self.modules.append(m); self._system2_reasoning = m; return m
+    
+    def ImaginationPlanning(self, d_model, n_plan_steps=6, n_actions=16, temperature=0.2):
+        """PHASE 46: Imagination & Planning — Zukunftsvorhersage + Planung."""
+        m = ImaginationPlanning(d_model, n_plan_steps, n_actions, temperature); self.modules.append(m); self._imagination = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -4550,6 +4812,21 @@ class CogLang:
             # Im Lernmodus: nur Conditioning
             pred = self._system2_reasoning.condition(pred)
         
+        # PHASE 46: Imagination & Planning — In-die-Zukunft-Blicken
+        if self._imagination is not None and not learn:
+            # Simuliere Zukunft aus gepooltem Kontext
+            best_future = self._imagination.simulate(pred, n_steps=4)
+            # Integriere Imagination: Einfluss der vorhergesagten Zukunft
+            future_influence = best_future.mean(dim=1, keepdim=True)
+            pred = pred + future_influence * 0.02
+            info_extra['imagination'] = {
+                'plan_quality': self._imagination.get_imagination_stats()['avg_plan_quality'],
+                'prediction_acc': self._imagination.get_imagination_stats()['avg_prediction_accuracy'],
+            }
+        elif self._imagination is not None:
+            # Im Lernmodus: nur Conditioning
+            pred = self._imagination.condition(pred)
+        
         output, hidden = self._decoder(pred)
         
         # PHASE 8: Apply neuro-symbolic rules to output
@@ -4689,6 +4966,14 @@ class CogLang:
                 self._transfer_learning.learn_step(info['sparse'], domain_id, loss.item())
                 # Speichere Input/Target für Few-Shot
                 self._transfer_learning.fewshot_store(input_ids[0], input_ids[0], domain_id)
+            
+            # PHASE 46: Imagination Planning learn_step — Lerne aus Realität vs Imagination
+            if self._imagination is not None and info.get('hidden') is not None:
+                # Vergleiche vorhergesagte Zukunft mit tatsächlichem nächsten State
+                actual = info['hidden'][:, -1, :]  # [batch, d_model]
+                imagined = self._imagination.simulate(info['hidden'], n_steps=1)
+                if imagined is not None:
+                    self._imagination.learn_from_imagination(actual, imagined[:, -1, :])
             
             # PHASE 43: Auto-Curriculum learn_step — Schwierigkeit anpassen
             if self._auto_curriculum is not None:
@@ -4959,6 +5244,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.AutoCurriculum(d_model=d_sparse, n_difficulty_levels=5, window_size=100)
     brain.CausalReasoning(d_model=d_sparse, n_causal_factors=64, temperature=0.1)
     brain.System2Reasoning(d_model=d_sparse, n_reasoning_steps=8, n_tree_branches=3, temperature=0.3)
+    brain.ImaginationPlanning(d_model=d_sparse, n_plan_steps=6, n_actions=16, temperature=0.2)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

@@ -560,6 +560,22 @@ def run_evolution():
             # Set default domain (used for logging; 'mixed' when blending)
             current_domain = 'mixed'
 
+            # PHASE 33: ActiveInference — Curiosity-gated domain selection
+            # Blend curriculum weights with ActiveInference domain preferences
+            if hasattr(brain, '_active_inference') and brain._active_inference is not None:
+                ai_prefs = brain.get_domain_preference()  # [n_domains]
+                # Blend: 70% curriculum + 30% curiosity (steigert curiosity über Zeit)
+                curiosity_blend = min(0.3, 0.05 + step / steps_per_iter * 0.25)
+                domain_names = ['text', 'code', 'security', 'network']
+                for i, d in enumerate(domain_names):
+                    if d in domain_weights:
+                        domain_weights[d] = (1 - curiosity_blend) * domain_weights[d] + curiosity_blend * ai_prefs[i].item()
+                # Renormalize
+                total_w = sum(domain_weights.values())
+                if total_w > 0:
+                    for d in domain_weights:
+                        domain_weights[d] /= total_w
+
             # -----------------------------------------------------------------
             #  PHASE 30: Get batch with smooth domain blending
             # -----------------------------------------------------------------
@@ -588,6 +604,11 @@ def run_evolution():
                 async_loader.start()  # Lazy start
                 batch = async_loader.get_batch()
                 batch_target = batch
+            
+            # PHASE 33: Set current domain on brain for ActiveInference tracking
+            if hasattr(brain, '_current_domain'):
+                domain_idx_map = {'text': 0, 'code': 1, 'security': 2, 'network': 3, 'mixed': 0}
+                brain._current_domain = domain_idx_map.get(current_domain, 0)
 
             # -----------------------------------------------------------------
             #  PHASE 24: AGGRESSIVE LR for fresh Hebbian model
@@ -775,6 +796,8 @@ def run_evolution():
                             'domain_perplexity': domain_ppl,
                             'multi_task_ce': loss_components.get('ce_loss', 0),
                             'multi_task_aux': loss_components.get('aux_loss', 0),
+                            # PHASE 33: Active Inference Report
+                            'active_inference': brain.get_active_inference_report() if hasattr(brain, 'get_active_inference_report') else {},
                         }
                         with open('/home/anima/train_state.json', 'w') as sf:
                             json.dump(state, sf)
@@ -823,6 +846,17 @@ def run_evolution():
                     config=config
                 )
                 return
+
+        # =====================================================================
+        #  PHASE 34: SLEEP PHASE — Konsolidierung vor Iterationsende
+        # =====================================================================
+        print('\n[SLEEP] Konsolidierungsphase gestartet...')
+        if hasattr(brain, 'run_sleep_phase'):
+            sleep_report = brain.run_sleep_phase(n_steps=200, device=device)
+            print(f'[SLEEP] {sleep_report.get("steps", 0)} Schritte, '
+                  f'{sleep_report.get("active_patterns", 0)} aktive Patterns, '
+                  f'Zyklus {sleep_report.get("sleep_cycle", 0)}')
+        print('[SLEEP] Konsolidierung abgeschlossen.')
 
         # =====================================================================
         #  ITERATION SUCCESS COMPLETION

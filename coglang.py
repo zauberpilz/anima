@@ -925,44 +925,409 @@ class OutputDecoder(CogModule):
         return d_hidden
 
 
-class IntrinsicMotivation(CogModule):
+class ActiveInference(CogModule):
     """
-    PHASE 7: Intrinsische Motivation — Neugier-getriebenes Lernen.
-    Prediction Error wird als interner Reward-Signal genutzt.
-    Hoher Error (Novelty) -> erhöhtes Lernen. Niedriger Error -> Stabilisierung.
+    PHASE 33: Active Inference — Free Energy Principle + Curiosity-Driven Exploration.
+    
+    Ersetzt PHASE 7 (IntrinsicMotivation). Das Modell minimiert nicht nur Prediction 
+    Error (passiv), sondern sucht aktiv nach lernreichen Erfahrungen.
+    
+    Kernsignale:
+    1. Epistemic Value: Wie viel kann das Modell HIER lernen? (Error-Differenz)
+    2. Information Gain: Tatsächlicher Wissenszuwachs (Error-Reduktion über Zeit)
+    3. Free Energy: Gesamt-Entropie = Komplexität + Inaccuracy
+    4. Novelty: Abweichung von bekannten Mustern (hoher Error)
+    
+    Ausgabe: Curiosity-Gating-Signal für Datenauswahl + LR-Modulation.
     """
-    def __init__(self, d_model):
+    def __init__(self, d_model, n_domains=4, memory_size=1024):
         super().__init__()
         self.d_model = d_model
-        self.register_buffer('curiosity_drive', torch.tensor(0.5))  # Internal curiosity level
-        self.register_buffer('novelty_threshold', torch.tensor(1.0))
+        self.n_domains = n_domains
+        
+        # ——— Intrinsic Drive States ———
+        self.register_buffer('curiosity_drive', torch.tensor(0.5))
+        self.register_buffer('exploration_bonus', torch.tensor(0.0))
+        self.register_buffer('free_energy', torch.tensor(0.0))
+        
+        # ——— Per-Domain Uncertainty Tracking ———
+        # Jede Domain hat eigene Error-Statistiken
+        self.register_buffer('domain_errors', torch.zeros(n_domains))
+        self.register_buffer('domain_uncertainty', torch.ones(n_domains) * 0.5)
+        self.register_buffer('domain_visit_counts', torch.ones(n_domains))
+        
+        # ——— Learning Progress Tracker ———
+        # Trackt ob Error fällt (learning) oder steigt (forgetting)
+        self.register_buffer('learning_progress', torch.zeros(n_domains))
+        # EMA der letzten Errors pro Domain
+        self.register_buffer('error_ema_fast', torch.zeros(n_domains))  # Kurzzeit-EMA
+        self.register_buffer('error_ema_slow', torch.zeros(n_domains))  # Langzeit-EMA
+        self._error_log = []  # Letzte 1000 Errors für Free Energy
+        
+        # ——— Epistemic Value Buffer ———
+        # Speichert kürzliche (error, domain)-Paare für Epistemic Value
+        self.register_buffer('epistemic_buffer', torch.zeros(memory_size, 2))
+        self._epistemic_idx = 0
+        self._epistemic_count = 0
+        
+        # ——— Reward History ———
         self.register_buffer('reward_history', torch.zeros(100))
         self._reward_idx = 0
         
-    def compute_intrinsic_reward(self, error):
+        # ——— Kalman-Filter Zustand pro Domain ———
+        # Schätzung: error = wahrer Wert + Rauschen
+        self.register_buffer('kalman_mean', torch.zeros(n_domains))    # Geschätzter wahrer Error
+        self.register_buffer('kalman_var', torch.ones(n_domains))      # Unsicherheit der Schätzung
+        self._kalman_r = 0.1   # Messrauschen
+        self._kalman_q = 0.01  # Prozessrauschen
+        
+    def _kalman_update(self, domain_idx, error_obs):
+        """Kalman-Filter: Schätze wahren Error pro Domain."""
+        # Predict
+        pred_mean = self.kalman_mean[domain_idx]
+        pred_var = self.kalman_var[domain_idx] + self._kalman_q
+        
+        # Update
+        K = pred_var / (pred_var + self._kalman_r)  # Kalman Gain
+        innovation = error_obs - pred_mean
+        self.kalman_mean[domain_idx] = pred_mean + K * innovation
+        self.kalman_var[domain_idx] = (1 - K) * pred_var
+        
+        return innovation.item()  # Wie überraschend war dieser Error?
+        
+    def observe(self, error, domain_idx=0):
         """
-        Compute intrinsic reward from prediction error.
-        Returns: reward scalar and curiosity modulation factor.
+        Hauptmethode: Beobachte Prediction Error und aktualisiere alle Signale.
+        
+        Args:
+            error: torch.Tensor [batch, seq, d_model] — aktueller Prediction Error
+            domain_idx: int — Index der aktuellen Domain (0=text,1=code,2=security,3=network)
+        
+        Returns:
+            dict mit:
+                - 'curiosity_factor': float — LR-Multiplikator (0.5=verlangsamen, 2.0=beschleunigen)
+                - 'information_gain': float — Wissenszuwachs dieser Observation
+                - 'domain_weights': torch.Tensor [n_domains] — Domain-Gewichtung für Sampling
+                - 'free_energy': float — Aktuelle Free Energy
+                - 'epistemic_value': float — Epistemischer Wert
         """
         with torch.no_grad():
-            # Error magnitude as novelty signal
-            error_norm = (error ** 2).sum(dim=-1).mean().item()
+            # ——— 1. Error-Tracking ———
+            error_norm = (error ** 2).mean().item()
             
-            # Intrinsic reward: higher when error exceeds threshold (novelty detection)
-            intrinsic_reward = max(0, error_norm - self.novelty_threshold.item())
+            # ——— 2. Kalman-Update pro Domain ———
+            innovation = self._kalman_update(domain_idx, error_norm)
             
-            # Update curiosity drive with exponential moving average
-            self.curiosity_drive = 0.95 * self.curiosity_drive + 0.05 * intrinsic_reward
+            # ——— 3. Update Domain-Statistiken ———
+            self.domain_errors[domain_idx] = error_norm
+            self.domain_visit_counts[domain_idx] += 1
             
-            # Update reward history
+            # EMA Updates (unterschiedliche Zeitskalen)
+            self.error_ema_fast[domain_idx] = 0.9 * self.error_ema_fast[domain_idx] + 0.1 * error_norm
+            self.error_ema_slow[domain_idx] = 0.99 * self.error_ema_slow[domain_idx] + 0.01 * error_norm
+            
+            # Learning Progress: Schnelle EMA - Langsame EMA
+            # Positiv = Error sinkt (lernt), Negativ = Error steigt (vergisst)
+            progress = self.error_ema_slow[domain_idx].item() - self.error_ema_fast[domain_idx].item()
+            self.learning_progress[domain_idx] = progress
+            
+            # Domain Uncertainty: Kalman Variance + Error-Varianz
+            self.domain_uncertainty[domain_idx] = self.kalman_var[domain_idx].item()
+            
+            # ——— 4. Free Energy = Komplexität + Inaccuracy ———
+            complexity = self.kalman_var.sum().item()  # Gesamt-Unsicherheit
+            inaccuracy = (self.error_ema_fast ** 2).sum().item()  # Gesamt-Error
+            self.free_energy = torch.tensor(complexity + inaccuracy)
+            
+            # ——— 5. Information Gain (Epistemic Value) ———
+            # Wie viel NEUES haben wir gelernt? = |innovation| * (1 - certainty)
+            certainty = 1.0 / (1.0 + self.kalman_var[domain_idx].item())
+            info_gain = abs(innovation) * (1.0 - certainty)
+            
+            # ——— 6. Epistemic Buffer & Value ———
+            self.epistemic_buffer[self._epistemic_idx] = torch.tensor([error_norm, info_gain])
+            self._epistemic_idx = (self._epistemic_idx + 1) % len(self.epistemic_buffer)
+            self._epistemic_count = min(self._epistemic_count + 1, len(self.epistemic_buffer))
+            
+            # Epistemic Value: Durchschnittlicher Info Gain der letzten N Beobachtungen
+            if self._epistemic_count > 0:
+                recent_values = self.epistemic_buffer[:self._epistemic_count, 1]
+                epistemic_value = recent_values.mean().item()
+            else:
+                epistemic_value = 0.0
+            
+            # ——— 7. Curiosity Drive ———
+            # Steigt mit hohem Info Gain, fällt mit niedrigem
+            curiosity_target = 0.3  # Gewünschtes Curiosity-Level
+            curiosity_error = info_gain - curiosity_target
+            self.curiosity_drive = 0.99 * self.curiosity_drive + 0.01 * (0.5 + curiosity_error * 2)
+            self.curiosity_drive = torch.clamp(self.curiosity_drive, 0.1, 2.0)
+            
+            # ——— 8. Exploration Bonus ———
+            # Domains mit hoher Unsicherheit bekommen Bonus
+            exploration = self.domain_uncertainty.max().item()
+            self.exploration_bonus = torch.tensor(exploration)
+            
+            # ——— 9. Intrinsic Reward ———
+            intrinsic_reward = info_gain * (1.0 + exploration)
+            
+            # Reward History
             self.reward_history[self._reward_idx] = intrinsic_reward
             self._reward_idx = (self._reward_idx + 1) % 100
             
-            # Curiosity modulation: scale learning based on recent rewards
-            avg_reward = self.reward_history.mean().item()
-            curiosity_factor = 1.0 + avg_reward * 0.5  # Boost learning when curious
+            # ——— 10. Domain-Weights für aktives Sampling ———
+            # Domains mit hohem epistemic_value + exploration bekommen mehr Gewicht
+            base_weights = 1.0 + self.domain_uncertainty * 2.0 + torch.clamp(self.learning_progress * 5, -0.5, 2.0)
+            # Aber nicht zu extrem: softmax-Skalierung
+            domain_weights = torch.softmax(base_weights / 0.5, dim=-1)
+            # Mindestgewicht für jede Domain (verhindert Vernachlässigung)
+            min_weight = 0.05 / self.n_domains
+            domain_weights = torch.clamp(domain_weights, min=min_weight)
+            domain_weights = domain_weights / domain_weights.sum()
             
-            return intrinsic_reward, curiosity_factor
+            # ——— 11. Curiosity Factor ———
+            # Wenn wir viel lernen (hoher info_gain): höhere LR
+            # Wenn wir nichts lernen: niedrigere LR (conservation mode)
+            avg_recent_reward = self.rewards_history.mean().item() if hasattr(self, 'reward_history') else 0.0
+            curiosity_factor = 0.5 + self.curiosity_drive.item() * avg_recent_reward
+            curiosity_factor = max(0.3, min(3.0, curiosity_factor))
+            
+            # ——— 12. Error-Log für Metriken ———
+            self._error_log.append(error_norm)
+            if len(self._error_log) > 1000:
+                self._error_log.pop(0)
+            
+            return {
+                'curiosity_factor': curiosity_factor,
+                'information_gain': info_gain,
+                'domain_weights': domain_weights,
+                'free_energy': self.free_energy.item(),
+                'epistemic_value': epistemic_value,
+                'intrinsic_reward': intrinsic_reward,
+                'exploration_bonus': exploration,
+                'learning_progress': progress,
+                'innovation': innovation,
+                'domain_uncertainty': self.domain_uncertainty.clone(),
+            }
+    
+    def get_domain_preference(self):
+        """
+        Returns: torch.Tensor [n_domains] — normalized preference weights for domain sampling.
+        """
+        with torch.no_grad():
+            base_weights = 1.0 + self.domain_uncertainty * 2.0 + torch.clamp(self.learning_progress * 5, -0.5, 2.0)
+            domain_weights = torch.softmax(base_weights / 0.5, dim=-1)
+            min_weight = 0.05 / self.n_domains
+            domain_weights = torch.clamp(domain_weights, min=min_weight)
+            return domain_weights / domain_weights.sum()
+    
+    def get_report(self):
+        """Gibt aktuelles State-Report zurück (für Logging/Monitoring)."""
+        return {
+            'curiosity': f'{self.curiosity_drive.item():.3f}',
+            'free_energy': f'{self.free_energy.item():.3f}',
+            'exploration': f'{self.exploration_bonus.item():.3f}',
+            'domain_uncertainty': [f'{x:.3f}' for x in self.domain_uncertainty.tolist()],
+            'domain_weights': [f'{x:.3f}' for x in self.get_domain_preference().tolist()],
+            'learning_progress': [f'{x:.3f}' for x in self.learning_progress.tolist()],
+        }
+
+
+class SleepReplay(CogModule):
+    """
+    PHASE 34: Sleep/Replay — Konsolidierungsmechanismus für Langzeitspeicherung.
+    
+    Nachahmt den hippocampal-neocorticalen Konsolidierungsprozess des Gehirns:
+    1. Replay: Wiederhole alte Erfahrungen, verstärke wichtige Muster
+    2. Merging: Verbinde neue Erfahrungen mit bestehendem Wissen
+    3. Pruning: Entferne schwache/irrelevante Verbindungen
+    
+    Das Modell lernt während des "Schlafs" aus seinem eigenen Replay-Puffer,
+    ohne neuen externen Input. Dadurch werden wichtige Muster stabilisiert
+    und unwichtige verlernen sich (cognitive offloading).
+    """
+    def __init__(self, buffer_size=10000, d_model=None):
+        super().__init__()
+        self.buffer_size = buffer_size
+        self.d_model = d_model
+        
+        # ——— Replay Buffer ———
+        # Speichert (input_ids, error_norm, domain, timestamp)
+        self.register_buffer('replay_inputs', torch.zeros(buffer_size, 128, dtype=torch.long))
+        self.register_buffer('replay_errors', torch.zeros(buffer_size))
+        self.register_buffer('replay_domains', torch.zeros(buffer_size, dtype=torch.long))
+        self.register_buffer('replay_weights', torch.zeros(buffer_size))  # Wichtigkeit
+        self.register_buffer('replay_age', torch.zeros(buffer_size))
+        self._replay_idx = 0
+        self._replay_count = 0
+        
+        # ——— Sleep-Parameter ———
+        self.register_buffer('sleep_cycle', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('last_sleep_step', torch.tensor(0.0))
+        self._sleep_duration = 100  # Steps pro Sleep-Phase
+        self._replay_batch_size = 8
+        self._consolidation_factor = 0.1  # Wie stark konsolidiert wird
+        
+        # ——— Pattern Stats ———
+        self.register_buffer('pattern_strength', torch.zeros(buffer_size))
+        self.register_buffer('pattern_age', torch.zeros(buffer_size))
+        
+    def store(self, input_ids, error_norm, domain_idx=0, importance=1.0):
+        """
+        Speichere Erfahrung im Replay-Buffer.
+        
+        Args:
+            input_ids: [batch, seq] — Modell-Input
+            error_norm: float — Prediction Error dieser Erfahrung
+            domain_idx: int — Domain-Index
+            importance: float — Wichtigkeit (1.0=normal, >1.0=wichtig, <1.0=unwichtig)
+        """
+        with torch.no_grad():
+            batch = input_ids.size(0)
+            for b in range(batch):
+                idx = self._replay_idx % self.buffer_size
+                
+                # Speichere ersten Sequenzabschnitt (max 128 Tokens)
+                seq = input_ids[b, :min(128, input_ids.size(1))]
+                self.replay_inputs[idx, :len(seq)] = seq[:128]
+                self.replay_errors[idx] = error_norm
+                self.replay_domains[idx] = domain_idx
+                self.replay_weights[idx] = importance
+                self.replay_age[idx] = 0
+                
+                # Pattern: höherer Error + höhere Importance = stärkeres Pattern
+                self.pattern_strength[idx] = error_norm * importance
+                self.pattern_age[idx] = 0
+                
+                self._replay_idx += 1
+                self._replay_count = min(self._replay_count + 1, self.buffer_size)
+    
+    def should_sleep(self, current_step, force=False):
+        """Entscheide ob eine Sleep-Phase nötig ist."""
+        if force:
+            return True
+        # Sleep alle 1000 Steps für 100 Steps
+        sleep_interval = 1000
+        return (current_step % sleep_interval) > (sleep_interval - self._sleep_duration)
+    
+    def sleep_step(self, model, device='cuda'):
+        """
+        Führe EINEN Sleep-Step aus: replaye eine gespeicherte Erfahrung.
+        
+        Args:
+            model: CogLang-Instanz
+            device: torch device
+        
+        Returns:
+            dict mit Sleep-Metriken
+        """
+        with torch.no_grad():
+            if self._replay_count < 10:
+                return {'replayed': 0, 'consolidation_loss': 0.0}
+            
+            # ——— 1. Wichtige Erfahrungen bevorzugen (Priority Sampling) ———
+            weights = self.pattern_strength[:self._replay_count].clone()
+            # Altern: auch alte Erfahrungen nicht vergessen (Age Penalty)
+            age_penalty = torch.exp(-self.pattern_age[:self._replay_count] * 0.01)
+            weights = weights * age_penalty
+            
+            # Sanfte Verteilung
+            if weights.sum() < 1e-8:
+                weights = torch.ones(self._replay_count)
+            probs = weights / weights.sum()
+            
+            # ——— 2. Sample Batch aus Buffer ———
+            n = min(self._replay_batch_size, self._replay_count)
+            indices = torch.multinomial(probs, n, replacement=True)
+            batch = self.replay_inputs[indices].to(device)  # [n, 128]
+            
+            # ——— 3. Replay: Forward + Learn ———
+            # Kontext: Verstärke Muster, die das Modell bereits kennt
+            # Das Ziel des Replays ist KONSOLIDIERUNG, nicht neues Lernen
+            
+            # Original-Loss vor Replay messen
+            orig_out, orig_info = model.forward(batch, learn=False)
+            orig_loss = F.cross_entropy(orig_out.view(-1, orig_out.size(-1)), batch.view(-1))
+            
+            # Replay mit niedriger LR (conservative learning)
+            # Speichere originale LRs
+            original_lrs = {}
+            for module in model.modules.modules():
+                if hasattr(module, '_lr'):
+                    original_lrs[id(module)] = module._lr
+                    module._lr *= self._consolidation_factor  # Niedrige LR für Konsolidierung
+            
+            # Lerne aus Replay
+            replay_loss, _ = model.learn(batch)
+            
+            # Stelle LRs wieder her
+            for module in model.modules.modules():
+                if id(module) in original_lrs:
+                    module._lr = original_lrs[id(module)]
+            
+            # ——— 4. Consolodation: Verstärke wichtigen Patterns ———
+            # Erfolgreiche Replays (Loss gesunken) verstärken das Pattern
+            loss_change = orig_loss.item() - replay_loss
+            if loss_change > 0:  # Loss gesunken = erfolgreiche Konsolidierung
+                self.pattern_strength[indices] *= 1.0 + loss_change * 0.1
+                self.pattern_strength.clamp_(0.01, 10.0)
+            
+            # ——— 5. Alter alle Patterns ———
+            self.pattern_age[:self._replay_count] += 1
+            self.replay_age[:self._replay_count] += 1
+            
+            # ——— 6. Pruning: Entferne schwache Patterns (wenn Buffer voll) ———
+            if self._replay_count >= self.buffer_size:
+                # Finde schwächste Patterns und überschreibe sie
+                weak_mask = self.pattern_strength < 0.1
+                n_weak = weak_mask.sum().item()
+                if n_weak > 100:
+                    # Setze freie Slots zurück
+                    self.pattern_strength[weak_mask] = 0.0
+                    self.replay_inputs[weak_mask] = 0
+                    self.replay_errors[weak_mask] = 0
+                    self.replay_weights[weak_mask] = 0
+            
+            return {
+                'replayed': n,
+                'consolidation_loss': replay_loss,
+                'orig_loss': orig_loss.item(),
+                'loss_change': loss_change,
+                'patterns_used': int((self.pattern_strength > 0.1).sum().item()),
+            }
+    
+    def sleep_phase(self, model, n_steps=100, device='cuda'):
+        """
+        Führe komplette Sleep-Phase aus (mehrere Sleep-Steps).
+        
+        Args:
+            model: CogLang-Instanz
+            n_steps: int — Anzahl Sleep-Steps
+            device: torch device
+        
+        Returns:
+            dict mit Sleep-Report
+        """
+        self.sleep_cycle += 1
+        total_loss = 0.0
+        total_change = 0.0
+        
+        for _ in range(n_steps):
+            result = self.sleep_step(model, device)
+            total_loss += result.get('consolidation_loss', 0.0)
+            total_change += result.get('loss_change', 0.0)
+        
+        avg_loss = total_loss / max(1, n_steps)
+        avg_change = total_change / max(1, n_steps)
+        
+        return {
+            'sleep_cycle': self.sleep_cycle.item(),
+            'steps': n_steps,
+            'avg_consolidation_loss': avg_loss,
+            'avg_loss_change': avg_change,
+            'active_patterns': int((self.pattern_strength > 0.1).sum().item()),
+            'buffer_usage': f'{self._replay_count}/{self.buffer_size}',
+        }
 
 
 class NeuroSymbolicBridge(CogModule):
@@ -1388,12 +1753,13 @@ class CogLang:
         self._decoder = None
         self._context_embed = None
         self._memory = None
-        self._motivation = None
+        self._active_inference = None
         self._bridge = None
         self._es = None
         self._skills = None
         self._security_head = None
         self._network_encoder = None
+        self._sleep_replay = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -1418,6 +1784,12 @@ class CogLang:
         m = EvolutionStrategyOptimizer(d_model, population_size, sigma); self.modules.append(m); self._es = m; return m
     def SkillModule(self, d_model, n_skills=8):
         m = SkillModule(d_model, n_skills); self.modules.append(m); self._skills = m; return m
+
+    def ActiveInference(self, d_model, n_domains=4):
+        m = ActiveInference(d_model, n_domains); self.modules.append(m); self._active_inference = m; return m
+    
+    def SleepReplay(self, buffer_size=10000, d_model=None):
+        m = SleepReplay(buffer_size, d_model); self.modules.append(m); self._sleep_replay = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -1551,15 +1923,29 @@ class CogLang:
                     anomaly_target = (pred_error > pred_error.median()).float()
                     self._security_head.learn_step(info['sparse'], anomaly_target, pred_error)
             
-            # PHASE 7: Intrinsic Motivation - compute curiosity reward
-            if self._motivation is not None:
-                total_error = sum((e ** 2).sum().item() for e in info['errors'])
-                reward, curiosity_factor = self._motivation.compute_intrinsic_reward(info['errors'][0])
-                # Modulate meta-plasticity with curiosity
+            # PHASE 33: Active Inference — Curiosity + Free Energy + Epistemic Value
+            if self._active_inference is not None:
+                # Use first layer error for observation
+                first_error = info['errors'][0] if info['errors'] else torch.zeros_like(info['sparse'])
+                domain_idx = getattr(self, '_current_domain', 0)  # Updated externally by evolve script
+                ai_result = self._active_inference.observe(first_error, domain_idx=domain_idx)
+                
+                # Modulate meta-plasticity with curiosity factor
+                curiosity_factor = ai_result['curiosity_factor']
                 for module in self.modules.modules():
                     if hasattr(module, '_meta_lr_scale'):
                         module._meta_lr_scale *= curiosity_factor
-                        module._meta_lr_scale = max(0.1, min(2.0, module._meta_lr_scale))
+                        module._meta_lr_scale = max(0.1, min(3.0, module._meta_lr_scale))
+                
+                # Store ActiveInference results for external access (e.g., data sampling)
+                self._ai_result = ai_result
+            
+            # PHASE 34: SleepReplay — Speichere Erfahrung im Replay Buffer
+            if self._sleep_replay is not None:
+                error_norm = sum((e ** 2).mean().item() for e in info['errors']) / len(info['errors'])
+                domain_idx = getattr(self, '_current_domain', 0)
+                importance = 1.0 + error_norm * 0.5  # Höherer Error = wichtiger
+                self._sleep_replay.store(input_ids, error_norm, domain_idx=domain_idx, importance=importance)
             
             # PHASE 4: EWC Snapshot - alle 1000 Schritte Gewichte als Optimal sichern
             if not hasattr(self, '_ewc_step_counter'):
@@ -1584,6 +1970,25 @@ class CogLang:
             if hasattr(module, '_ewc_snapshot') and module is not self:
                 module._ewc_snapshot()
 
+    def run_sleep_phase(self, n_steps=100, device='cuda'):
+        """PHASE 34: Führe Sleep-Phase zur Konsolidierung aus."""
+        if self._sleep_replay is not None:
+            report = self._sleep_replay.sleep_phase(self, n_steps=n_steps, device=device)
+            return report
+        return {}
+    
+    def get_active_inference_report(self):
+        """PHASE 33: Gib aktuelles Active Inference Report zurück."""
+        if self._active_inference is not None:
+            return self._active_inference.get_report()
+        return {}
+    
+    def get_domain_preference(self):
+        """PHASE 33: Hole Domain-Präferenz für gewichtetes Sampling."""
+        if self._active_inference is not None:
+            return self._active_inference.get_domain_preference()
+        return torch.ones(4) / 4  # Uniform fallback
+    
     def parameter_count(self):
         return sum(p.numel() for p in self.modules.parameters())
 
@@ -1659,7 +2064,8 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.PredictiveStack(d_model=d_sparse, n_layers=n_layers, d_state=d_state, d_context=d_context, lr=lr, n_attention_heads=n_attention_heads)
     brain.OutputDecoder(d_sparse=d_sparse, d_model=d_model, vocab_size=vocab_size, lr=lr)
     brain.EpisodicMemory(d_model=d_sparse, memory_size=memory_size, target_dim=d_state)
-    brain.IntrinsicMotivation(d_model=d_sparse)
+    brain.ActiveInference(d_model=d_sparse, n_domains=4)
+    brain.SleepReplay(buffer_size=10000, d_model=d_sparse)
     brain.NeuroSymbolicBridge(vocab_size=vocab_size, d_model=d_sparse, n_rules=n_rules)
     brain.EvolutionStrategy(d_model=d_sparse, population_size=es_population, sigma=0.01)
     brain.SkillModule(d_model=d_sparse, n_skills=n_skills)

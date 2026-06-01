@@ -1,6 +1,7 @@
 """Cobra Evolution — Autonome Optimierungsschleife mit Multi-Domain, Curriculum, Multi-Task Loss."""
-import torch, torch.nn.functional as F, sys, time, json, os, math, gc
+import torch, torch.nn.functional as F, sys, time, json, os, math, gc, importlib
 sys.path.insert(0, '/home/anima/src')
+import coglang
 from coglang import build_anima, AsyncDataLoader, DynamicBatchSizer
 from data_loader import MultiDomainDataset, get_large_dataset, get_mixed_dataset
 from training_controller import TrainingController
@@ -471,6 +472,13 @@ def run_evolution():
     print(f'  Resume: python3 training_controller.py resume')
     print(f'  Stop:   python3 training_controller.py stop')
 
+    # Module neu laden (ermöglicht Code-Änderungen zwischen Iterationen)
+    importlib.reload(coglang)
+    from coglang import build_anima, AsyncDataLoader, DynamicBatchSizer
+    # gc vor Neubau
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     brain = build_anima(vocab_size=vocab_size, device=device,
                         d_model=config['d_model'], d_sparse=config['d_sparse'],
                         n_layers=config['n_layers'], d_state=config['d_state'],

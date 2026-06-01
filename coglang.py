@@ -5601,6 +5601,405 @@ class HierarchicalMemory(CogModule):
         }
 
 
+class HierarchicalGoal(CogModule):
+    """
+    PHASE 52: Hierarchische Zielsetzung — Goal Decomposer, Subgoal Tracker, Goal Adaptation.
+    
+    Baut auf GoalEncoder (Phase 36) auf und erweitert ihn zu einem vollständigen
+    hierarchischen Planungssystem:
+    
+    1. GoalDecomposer — Zerlege High-Level-Goals in Subgoals (automatisch)
+    2. SubgoalTracker — Verfolge Fortschritt: pending, active, completed, failed
+    3. GoalAdaptation — Passe Goals an bei Misserfolg (alternative Pfade)
+    
+    Architektur:
+    - Jedes Goal hat einen Embedding-Vektor (d_model)
+    - Subgoals sind als DAG organisiert (Dependencies)
+    - Decomposition lernt aus Erfolg/Misserfolg
+    - Adaptation nutzt MetaKognition-Strategien für alternative Pläne
+    
+    Goal-Zustände:
+    PENDING → ACTIVE → COMPLETED
+                         → FAILED → ADAPTED (alternatives Subgoal)
+    """
+    def __init__(self, d_model, max_goals=32, max_subgoals_per_goal=8, max_depth=4):
+        super().__init__()
+        self.d_model = d_model
+        self.max_goals = max_goals
+        self.max_subgoals_per_goal = max_subgoals_per_goal
+        self.max_depth = max_depth
+        
+        # =====================================================================
+        #  1. GOAL DECOMPOSER
+        # =====================================================================
+        # Zerlegt High-Level-Goal-Embedding in Subgoal-Embeddings
+        self.decomposer = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.Tanh(),
+            nn.Linear(d_model * 2, max_subgoals_per_goal * d_model),
+        )
+        
+        # Subgoal-Selector (welche Subgoals sind relevant?)
+        self.subgoal_selector = nn.Sequential(
+            nn.Linear(d_model, max_subgoals_per_goal),
+        )
+        
+        # =====================================================================
+        #  2. SUBGOAL TRACKER
+        # =====================================================================
+        # Goal-Struktur (Buffer)
+        self.register_buffer('goal_embeddings', torch.zeros(max_goals, d_model))
+        self.register_buffer('goal_depth', torch.zeros(max_goals, dtype=torch.long))  # Hierarchie-Ebene
+        self.register_buffer('goal_parent', torch.zeros(max_goals, dtype=torch.long))  # Parent-Index
+        self.register_buffer('goal_status', torch.zeros(max_goals, dtype=torch.long))  # 0=pending,1=active,2=completed,3=failed
+        self.register_buffer('goal_priority', torch.zeros(max_goals))  # 0..1
+        self.register_buffer('goal_progress', torch.zeros(max_goals))  # 0..1
+        self.register_buffer('goal_attempts', torch.zeros(max_goals, dtype=torch.long))
+        self.register_buffer('goal_success_history', torch.zeros(max_goals, 10))  # Letzte 10 Ergebnisse
+        
+        # Subgoal-Child-Index: pro Goal die Indizes seiner Subgoals
+        self.register_buffer('subgoal_children', torch.zeros(max_goals, max_subgoals_per_goal, dtype=torch.long))
+        self.register_buffer('subgoal_counts', torch.zeros(max_goals, dtype=torch.long))
+        
+        # Dependencies: subgoal B kann nicht starten bevor A erledigt ist
+        self.register_buffer('dependency_matrix', torch.zeros(max_goals, max_goals, dtype=torch.bool))
+        
+        # ——— Goal Embedding Encoder ———
+        # Projiziert Context-Embedding in Goal-Space (für Goal-Erkennung)
+        self.goal_encoder = nn.Linear(d_model, d_model, bias=False)
+        
+        # ——— Progress Estimator ———
+        # Schätzt Fortschritt aus aktuellen Hidden-States
+        self.progress_estimator = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, 1),
+        )
+        
+        self._goal_count = 0
+        self._active_goal_idx = -1  # Aktuell verfolgtes Goal
+        self._current_goal_embedding = None
+        
+        # =====================================================================
+        #  3. GOAL ADAPTATION
+        # =====================================================================
+        # Alternative Pfade bei Misserfolg
+        self.adaptation_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Tanh(),
+            nn.Linear(d_model, d_model),
+        )
+        
+        # Failure-Pattern-Memory: speichert, welche Goal-Typen oft scheitern
+        self.register_buffer('failure_patterns', torch.zeros(50, d_model))
+        self.register_buffer('failure_counts', torch.zeros(50))
+        self._failure_idx = 0
+        
+        self._max_weight = 2.0
+    
+    # =========================================================================
+    #  GOAL DECOMPOSITION
+    # =========================================================================
+    
+    def decompose(self, high_level_goal, depth=0, parent_idx=-1):
+        """
+        Zerlege ein High-Level-Goal in Subgoals.
+        
+        Args:
+            high_level_goal: [d_model] — Embedding des Hauptziels
+            depth: int — Aktuelle Tiefe in der Hierarchie
+            parent_idx: int — Index des Parent-Goals (-1 = root)
+            
+        Returns:
+            goal_idx: int — Index des erstellten Goals
+            n_subgoals: int — Anzahl erstellter Subgoals
+        """
+        with torch.no_grad():
+            # Erstelle neuen Goal-Eintrag
+            idx = self._goal_count % self.max_goals
+            self.goal_embeddings[idx] = high_level_goal
+            self.goal_depth[idx] = depth
+            self.goal_parent[idx] = max(0, parent_idx)
+            self.goal_status[idx] = 0  # PENDING
+            self.goal_priority[idx] = 1.0 if depth == 0 else 0.8 ** depth
+            self.goal_progress[idx] = 0.0
+            self.goal_attempts[idx] = 0
+            
+            # Verknüpfe mit Parent
+            if parent_idx >= 0:
+                child_count = self.subgoal_counts[parent_idx].item()
+                if child_count < self.max_subgoals_per_goal:
+                    self.subgoal_children[parent_idx, child_count] = idx
+                    self.subgoal_counts[parent_idx] += 1
+            
+            self._goal_count += 1
+            
+            # Dekomposition (nur wenn nicht zu tief)
+            n_subgoals = 0
+            if depth < self.max_depth:
+                # Generiere Subgoal-Kandidaten
+                raw_subgoals = self.decomposer(high_level_goal.unsqueeze(0))  # [1, max_subgoals * d]
+                raw_subgoals = raw_subgoals.view(self.max_subgoals_per_goal, self.d_model)
+                
+                # Selektion: welche Subgoals sind relevant?
+                relevance = torch.sigmoid(self.subgoal_selector(high_level_goal.unsqueeze(0)))  # [1, max]
+                relevance = relevance.squeeze(0)  # [max]
+                
+                # Wähle Top-k Subgoals (relevanz > 0.5)
+                selected = (relevance > 0.5).nonzero(as_tuple=True)[0]
+                
+                for si in selected[:self.max_subgoals_per_goal // 2]:  # Max 4 Subgoals
+                    sub_goal_emb = raw_subgoals[si]
+                    sub_idx, _ = self.decompose(sub_goal_emb, depth + 1, idx)
+                    n_subgoals += 1
+                    
+                    # Dependency: Subgoal muss vor Parent abgeschlossen sein
+                    if parent_idx >= 0:
+                        self.dependency_matrix[sub_idx, idx] = True
+            
+            # Falls keine Subgoals erstellt: setze als leaf (kann direkt ausgeführt werden)
+            if n_subgoals == 0:
+                self.goal_status[idx] = 1  # ACTIVE (kann direkt bearbeitet werden)
+            
+            return idx, n_subgoals
+    
+    # =========================================================================
+    #  GOAL TRACKING
+    # =========================================================================
+    
+    def set_active_goal(self, goal_idx):
+        """Setze ein Goal als aktiv."""
+        if 0 <= goal_idx < self.max_goals:
+            self._active_goal_idx = goal_idx
+            self.goal_status[goal_idx] = 1  # ACTIVE
+            self._current_goal_embedding = self.goal_embeddings[goal_idx]
+    
+    def update_progress(self, hidden_states, loss_val=None):
+        """
+        Aktualisiere Fortschritt des aktiven Goals.
+        
+        Args:
+            hidden_states: [batch, seq, d_model] — Aktuelle Hidden-States
+            loss_val: float oder None — Aktueller Loss (niedrig = mehr Fortschritt)
+        """
+        with torch.no_grad():
+            if self._active_goal_idx < 0:
+                return
+            
+            # Schätze Fortschritt aus Hidden-States
+            pooled = hidden_states.mean(dim=1)  # [batch, d_model]
+            raw_progress = torch.sigmoid(self.progress_estimator(pooled))  # [batch, 1]
+            est_progress = raw_progress.mean().item()
+            
+            # Loss-Boost: niedriger Loss = mehr Fortschritt
+            if loss_val is not None:
+                loss_progress = max(0.0, 1.0 - min(loss_val, 10.0) / 10.0)
+                est_progress = 0.5 * est_progress + 0.5 * loss_progress
+            
+            # Aktualisiere
+            current = self.goal_progress[self._active_goal_idx].item()
+            self.goal_progress[self._active_goal_idx] = max(current, est_progress)
+            
+            # Bei Fortschritt > 0.8: als completed markieren
+            if self.goal_progress[self._active_goal_idx] > 0.8:
+                self.complete_goal(self._active_goal_idx)
+    
+    def complete_goal(self, goal_idx, success=True):
+        """Markiere Goal als completed oder failed."""
+        if success:
+            self.goal_status[goal_idx] = 2  # COMPLETED
+            
+            # Aktualisiere Parent-Progress
+            parent = self.goal_parent[goal_idx].item()
+            if parent >= 0 and parent < self.max_goals:
+                # Zähle completed children
+                n_children = self.subgoal_counts[parent].item()
+                if n_children > 0:
+                    completed = 0
+                    for c in range(n_children):
+                        child_idx = self.subgoal_children[parent, c].item()
+                        if self.goal_status[child_idx] == 2:  # COMPLETED
+                            completed += 1
+                    self.goal_progress[parent] = completed / n_children
+                    
+                    # Wenn alle Children completed: Parent auch completed
+                    if self.goal_progress[parent] >= 1.0 and self.goal_status[parent] != 2:
+                        self.goal_status[parent] = 2
+        else:
+            self.goal_status[goal_idx] = 3  # FAILED
+            self.goal_attempts[goal_idx] += 1
+            
+            # Speichere Failure-Pattern
+            emb = self.goal_embeddings[goal_idx]
+            f_idx = self._failure_idx % 50
+            self.failure_patterns[f_idx] = emb
+            self.failure_counts[f_idx] = self.goal_attempts[goal_idx].float()
+            self._failure_idx += 1
+    
+    # =========================================================================
+    #  GOAL ADAPTATION
+    # =========================================================================
+    
+    def adapt_goal(self, goal_idx, hidden_states):
+        """
+        Passe ein gescheitertes Goal an — generiere alternativen Pfad.
+        
+        Args:
+            goal_idx: int — Index des gescheiterten Goals
+            hidden_states: [batch, seq, d_model] — Aktueller Kontext
+            
+        Returns:
+            new_goal_idx: int — Index des adaptierten Goals (-1 wenn keine Adaptation)
+        """
+        with torch.no_grad():
+            if self.goal_status[goal_idx] != 3:  # Nur failed goals anpassen
+                return -1
+            
+            if self.goal_attempts[goal_idx] > 3:  # Max 3 Versuche
+                return -1
+            
+            orig_emb = self.goal_embeddings[goal_idx]
+            pooled = hidden_states.mean(dim=1)  # [batch, d_model]
+            ctx = pooled.mean(dim=0)  # [d_model]
+            
+            # Adaptation: [original_goal; context] → adapted_goal
+            adapt_in = torch.cat([orig_emb, ctx], dim=-1).unsqueeze(0)  # [1, 2*d]
+            adapted = self.adaptation_gate(adapt_in).squeeze(0)  # [d_model]
+            
+            # Erstelle neues Goal mit adaptiertem Embedding
+            parent = self.goal_parent[goal_idx].item()
+            new_idx, _ = self.decompose(adapted, depth=self.goal_depth[goal_idx].item() + 1, parent_idx=parent)
+            
+            # Setze Dependency: adaptiertes Goal braucht das Original nicht
+            self.dependency_matrix[new_idx, goal_idx] = False
+            
+            return new_idx
+    
+    # =========================================================================
+    #  GOAL CONDITIONING (Forward-Pass)
+    # =========================================================================
+    
+    def condition(self, hidden_states):
+        """
+        Konditioniere Hidden-States mit aktuellem Goal.
+        
+        Args:
+            hidden_states: [batch, seq, d_model] — Aktuelle Aktivierungen
+            
+        Returns:
+            conditioned: [batch, seq, d_model] — Goal-modulierte Aktivierungen
+        """
+        with torch.no_grad():
+            if self._current_goal_embedding is None:
+                return hidden_states
+            
+            batch, seq, d = hidden_states.shape
+            goal_exp = self._current_goal_embedding.unsqueeze(0).unsqueeze(0).expand(batch, seq, -1)
+            
+            # Gate-gesteuerte Goal-Modulation
+            gate_signal = torch.sigmoid((hidden_states * goal_exp).sum(dim=-1, keepdim=True) / (d ** 0.5))
+            
+            return hidden_states + gate_signal * goal_exp * 0.1
+    
+    def get_goal_embedding(self):
+        """Gib aktuelles Goal-Embedding zurück (für GoalEncoder-Kompatibilität)."""
+        return self._current_goal_embedding
+    
+    # =========================================================================
+    #  GOAL QUERIES
+    # =========================================================================
+    
+    def get_next_actionable_goal(self):
+        """
+        Finde das nächste Goal, das bearbeitet werden kann.
+        (alle Dependencies erfüllt, Status = PENDING)
+        
+        Returns:
+            goal_idx: int oder -1
+        """
+        for i in range(self._goal_count):
+            if self.goal_status[i] != 0:  # Nur PENDING
+                continue
+            if self.goal_depth[i] > self.max_depth:
+                continue
+            
+            # Prüfe Dependencies
+            deps_satisfied = True
+            for dep in range(self.max_goals):
+                if self.dependency_matrix[i, dep]:
+                    if self.goal_status[dep] != 2:  # Nicht completed
+                        deps_satisfied = False
+                        break
+            
+            if deps_satisfied:
+                return i
+        
+        return -1
+    
+    def get_goal_tree(self, root_idx=0, depth=0, max_depth=3):
+        """
+        Gib Goal-Baum als verschachteltes Dict zurück.
+        
+        Returns:
+            tree: dict mit goal_info und children
+        """
+        def _build_tree(idx, current_depth):
+            if current_depth > max_depth or idx >= self._goal_count:
+                return None
+            
+            status_names = ['PENDING', 'ACTIVE', 'COMPLETED', 'FAILED']
+            node = {
+                'index': idx,
+                'depth': self.goal_depth[idx].item(),
+                'status': status_names[self.goal_status[idx].item()],
+                'priority': self.goal_priority[idx].item(),
+                'progress': self.goal_progress[idx].item(),
+                'attempts': self.goal_attempts[idx].item(),
+            }
+            
+            children = []
+            n_child = self.subgoal_counts[idx].item()
+            for c in range(n_child):
+                child_idx = self.subgoal_children[idx, c].item()
+                child_node = _build_tree(child_idx, current_depth + 1)
+                if child_node:
+                    children.append(child_node)
+            
+            if children:
+                node['children'] = children
+            
+            return node
+        
+        return _build_tree(root_idx, depth)
+    
+    def get_goal_stats(self):
+        """Gib Zielsetzungs-Statistiken."""
+        total = self._goal_count
+        if total == 0:
+            return {
+                'n_goals': 0, 'n_completed': 0, 'n_failed': 0,
+                'n_active': 0, 'n_pending': 0, 'success_rate': 0.0,
+            }
+        
+        completed = (self.goal_status[:total] == 2).sum().item()
+        failed = (self.goal_status[:total] == 3).sum().item()
+        active = (self.goal_status[:total] == 1).sum().item()
+        pending = (self.goal_status[:total] == 0).sum().item()
+        
+        success_rate = completed / max(1, completed + failed)
+        
+        return {
+            'n_goals': total,
+            'n_completed': completed,
+            'n_failed': failed,
+            'n_active': active,
+            'n_pending': pending,
+            'success_rate': success_rate,
+            'max_depth': self.max_depth,
+            'max_subgoals': self.max_subgoals_per_goal,
+        }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -5631,6 +6030,7 @@ class CogLang:
         self._exploration = None
         self._metakognition = None
         self._hierarchical_memory = None
+        self._hierarchical_goal = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -5737,6 +6137,13 @@ class CogLang:
         m = HierarchicalMemory(d_model, sensory_buffer_size, working_mem_size, episodic_buffer_size)
         self.modules.append(m)
         self._hierarchical_memory = m
+        return m
+
+    def HierarchicalGoal(self, d_model, max_goals=32, max_subgoals_per_goal=8, max_depth=4):
+        """PHASE 52: Hierarchical Goal — Goal Decomposer, Subgoal Tracker, Goal Adaptation."""
+        m = HierarchicalGoal(d_model, max_goals, max_subgoals_per_goal, max_depth)
+        self.modules.append(m)
+        self._hierarchical_goal = m
         return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
@@ -6024,6 +6431,23 @@ class CogLang:
                     'calibrated_confidence': calibrated.mean().item(),
                     'calibration_temp': self._metakognition.calibration_temperature.item(),
                 }
+        
+        # PHASE 52: Hierarchical Goal — Konditioniere mit aktuellem Goal
+        if self._hierarchical_goal is not None:
+            pred = self._hierarchical_goal.condition(pred)
+            if not learn:
+                goal_stats = self._hierarchical_goal.get_goal_stats()
+                info_extra['hierarchical_goal'] = {
+                    'n_goals': goal_stats['n_goals'],
+                    'n_active': goal_stats['n_active'],
+                    'n_completed': goal_stats['n_completed'],
+                    'n_pending': goal_stats['n_pending'],
+                    'n_failed': goal_stats['n_failed'],
+                    'success_rate': goal_stats['success_rate'],
+                }
+            else:
+                # Im Lernmodus: aktualisiere Goal-Fortschritt
+                self._hierarchical_goal.update_progress(pred, loss_val=getattr(self, '_current_loss', None))
         
         # PHASE 39: Tool Use — Erkenne und führe Tool-Aufrufe aus
         if self._tool_use is not None and not learn:
@@ -6467,6 +6891,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.ExplorationDrive(d_model=d_sparse, n_uncertainty_cells=128, n_emn_history=200)
     brain.MetaKognition(d_model=d_sparse, n_strategies=4, n_resource_levels=3)
     brain.HierarchicalMemory(d_model=d_sparse, sensory_buffer_size=1000, working_mem_size=256, episodic_buffer_size=500)
+    brain.HierarchicalGoal(d_model=d_sparse, max_goals=32, max_subgoals_per_goal=8, max_depth=4)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

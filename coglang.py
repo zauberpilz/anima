@@ -895,6 +895,269 @@ class PredictiveStack(CogModule):
             l.reset_state(batch_size, device)
 
 
+class HierarchicalPC(CogModule):
+    """
+    PHASE 35: Hierarchical Predictive Coding — Mehr-Ebenen-Architektur.
+    
+    Statt einem flachen PredictiveStack (alle Layer gleiche Dimension) hat CogLang
+    jetzt eine echte Hierarchie mit verschiedenen Abstraktionsebenen:
+    
+    Level 1 (Fast/Tokens):   d_sparse, volle Seq-Länge, hohe Auflösung
+      → Verarbeitet einzelne Tokens, schnelle Dynamik (timescale=1.0)
+    
+    Level 2 (Medium/Phrases): d_sparse/2, 4× komprimiert, mittlere Auflösung
+      → Erkennt Phrasen und kurze Muster, timescale=0.3
+    
+    Level 3 (Slow/Concepts):  d_sparse/4, 16× komprimiert, abstrakt
+      → Konzepte, Ziele, langfristige Abhängigkeiten, timescale=0.1
+    
+    Kommunikationsfluss:
+      Bottom-Up:  Level N+1 bekommt Prediction Error von Level N
+      Top-Down:   Level N+1 sagt Aktivität von Level N vorher
+      Ziel:       Minimaler Prediction Error auf ALLEN Ebenen
+    
+    Emergenz-Effekt: Das Modell entwickelt automatisch abstrakte Repräsentationen,
+    weil Level 3 nur überleben kann, wenn es Level 2 gut vorhersagt — das zwingt
+    Level 3 dazu, echte Konzepte zu lernen.
+    """
+    def __init__(self, d_model, n_levels=3, n_layers_per_level=None,
+                 d_state=64, d_context=128, n_attention_heads=4):
+        super().__init__()
+        self.d_model = d_model
+        self.n_levels = n_levels
+        if n_layers_per_level is None:
+            n_layers_per_level = [6, 4, 2]  # Level 1 tief, Level 3 flach
+        self.n_layers_per_level = n_layers_per_level
+        
+        # ——— Ebenen-Konfiguration ———
+        # Jede Ebene hat eigene Dimension (kleiner = abstrakter)
+        level_dims = []
+        current_dim = d_model
+        for i in range(n_levels):
+            level_dims.append(current_dim)
+            current_dim = max(64, current_dim // 2)  # Halbiere pro Ebene
+        self.level_dims = level_dims
+        
+        # ——— Predictive Stacks pro Ebene ———
+        self.stacks = nn.ModuleList()
+        for i in range(n_levels):
+            dim = level_dims[i]
+            n_layers = n_layers_per_level[i] if i < len(n_layers_per_level) else 4
+            # Tiefere Ebenen (höheres i) haben langsamere Timescale
+            timescale_scale = 1.0 / (2 ** i) if i > 0 else 1.0
+            stack = PredictiveStack(dim, n_layers, 
+                                     max(32, d_state // (2 ** i)),
+                                     max(64, d_context // (2 ** i)),
+                                     n_attention_heads)
+            # Set timescale for all layers in this stack
+            for layer in stack.layers:
+                layer.timescale = timescale_scale * max(0.1, 1.0 - (layer.timescale - 0.1) * (1 - timescale_scale))
+            stack.level_timescale = timescale_scale
+            self.stacks.append(stack)
+        
+        # ——— Bottom-Up Encoder (Level N → Level N+1) ———
+        # Nimmt Error von Level N und projiziert auf Level N+1 Dimension
+        self.enc_bottom_up = nn.ModuleList()
+        for i in range(n_levels - 1):
+            in_dim = level_dims[i]
+            out_dim = level_dims[i + 1]
+            self.enc_bottom_up.append(nn.Linear(in_dim, out_dim, bias=False))
+        
+        # ——— Top-Down Predictor (Level N+1 → Level N) ———
+        # Sagt Aktivität von Level N aus Level N+1 Zustand vorher
+        self.pred_top_down = nn.ModuleList()
+        for i in range(n_levels - 1):
+            in_dim = level_dims[i + 1]
+            out_dim = level_dims[i]
+            self.pred_top_down.append(nn.Linear(in_dim, out_dim, bias=False))
+        
+        # ——— Temporal Compression ———
+        # Level 1: every token, Level 2: every 4 tokens, Level 3: every 16 tokens
+        self.compression_factors = [1]
+        for i in range(1, n_levels):
+            self.compression_factors.append(self.compression_factors[-1] * 4)
+        
+        # ——— Kontext-Projektionen ———
+        # Level 1 bekommt Original-Kontext, höhere Ebenen projizierte Versionen
+        self.context_proj = nn.ModuleList()
+        if n_levels > 1:
+            for i in range(1, n_levels):
+                self.context_proj.append(nn.Linear(d_context, max(64, d_context // (2 ** i)), bias=False))
+        
+        # ——— Metrik-Tracking ———
+        self.register_buffer('level_errors', torch.zeros(n_levels))
+        self.register_buffer('level_agreement', torch.ones(n_levels))  # Top-Down ↔ Bottom-Up Agreement
+        
+    def _downsample(self, x, factor):
+        """Downsample sequence by factor using average pooling."""
+        if factor <= 1 or x.size(1) < factor:
+            return x
+        batch, seq, dim = x.shape
+        # Pad to multiple of factor
+        pad = factor - (seq % factor)
+        if pad < factor:
+            x = F.pad(x, (0, 0, 0, pad))
+        # Reshape and average pool
+        x = x.view(batch, -1, factor, dim).mean(dim=2)
+        return x
+    
+    def _upsample(self, x, target_len):
+        """Upsample sequence to target length using nearest-neighbor interpolation."""
+        batch, seq, dim = x.shape
+        if seq == 0:
+            return torch.zeros(batch, target_len, dim, device=x.device)
+        # Repeat each element to fill target length
+        repeats = (target_len + seq - 1) // seq
+        x = x.repeat_interleave(repeats, dim=1)
+        return x[:, :target_len, :]
+    
+    def forward(self, x, context=None, memory_retrieved=None, errors_for_attn=None, learn=True):
+        """
+        Hierarchical forward pass.
+        
+        Args:
+            x: [batch, seq, d_model] — Input (bottom level)
+            context: [batch, seq, d_context] — Context embeddings
+            memory_retrieved: [batch, seq, d_model] — Episodic memory
+            learn: bool — Enable learning
+        
+        Returns:
+            all_errors: Liste aller Errors (alle Ebenen, alle Layer)
+            all_states: Liste aller States
+            mixed_pred: Kombinierte Prediction (auf originaler Dimension)
+            level_reports: Dict mit Ebenen-Metriken
+        """
+        with torch.no_grad():
+            batch, seq, d = x.shape
+            device = x.device
+            
+            # ——— Level 0 Processing (immer aktiv) ———
+            # Level 0 ist der Input selbst (Sensorische Ebene)
+            
+            # ——— Level 1: Token-Level (volle Auflösung) ———
+            l1_context = context  # Original-Kontext
+            
+            # Downsample Memory Retrieval für Level 1
+            l1_memory = memory_retrieved  # [batch, seq, d_model]
+            
+            l1_errors, l1_states, l1_preds = self.stacks[0](
+                x, l1_context, memory_retrieved=l1_memory, learn=learn
+            )
+            
+            # Level 1 Prediction (gemischt aus allen Sub-Layern)
+            l1_pred = self.stacks[0].mixed_prediction(l1_preds)  # [batch, seq, d_model]
+            
+            # Level 1 Error (Differenz zwischen Prediction und Input)
+            l1_error = x - l1_pred  # [batch, seq, d_model]
+            
+            # ——— Höhere Ebenen (Level 2, Level 3, ...) ———
+            higher_errors = []
+            higher_states = []
+            higher_preds = []
+            
+            current_bottom_up = l1_error  # Start: Error von Level 1
+            
+            for level_idx in range(1, self.n_levels):
+                stack = self.stacks[level_idx]
+                comp = self.compression_factors[level_idx]
+                dim = self.level_dims[level_idx]
+                
+                # ——— Bottom-Up Encoding ———
+                # 1. Downsample: komprimiere Sequenz
+                bu_down = self._downsample(current_bottom_up, comp // self.compression_factors[level_idx - 1] if level_idx > 1 else comp)
+                # 2. Projection: auf Ebene-Dimension bringen
+                bu_encoded = self.enc_bottom_up[level_idx - 1](bu_down)  # [batch, seq/comp, dim]
+                
+                # ——— Kontext für diese Ebene ———
+                if level_idx == 1:
+                    level_context = context  # Level 1 hat Original-Kontext
+                else:
+                    ctx_proj = self.context_proj[level_idx - 1]
+                    level_context = self._downsample(context, comp)
+                    level_context = ctx_proj(level_context)
+                
+                # ——— Forward durch PredictiveStack dieser Ebene ———
+                # Normalisiere Input auf [0, 1]-Bereich (stabilisiert höhere Ebenen)
+                bu_input = torch.tanh(bu_encoded) * 0.5
+                
+                l_errors, l_states, l_preds = stack(
+                    bu_input, level_context, memory_retrieved=None, learn=learn
+                )
+                
+                # Gemischte Prediction dieser Ebene
+                l_pred = stack.mixed_prediction(l_preds)
+                
+                # Error dieser Ebene
+                l_error = bu_input - l_pred
+                
+                # ——— Top-Down Prediction ———
+                # Höhere Ebene sagt die Aktivität der aktuellen Ebene vorher
+                if level_idx < self.n_levels - 1:
+                    td_pred = self.pred_top_down[level_idx - 1](l_pred)
+                    # Upsample auf Level 1 Sequenzlänge
+                    td_pred_up = self._upsample(td_pred, seq)
+                    # Top-Down Modulation: korrigiere Level 1 Error basierend auf höherer Ebene
+                    # Der "korrigierte" Error = Level 1 Error + Top-Down Korrektur
+                    # Idee: Höhere Ebene sagt, was der Error SEIN SOLLTE
+                    current_bottom_up = l1_error + td_pred_up * 0.2
+                else:
+                    # Höchste Ebene: keine Top-Down Prediction mehr
+                    # Aber: Top-Down zur Ebene darunter
+                    td_pred = self.pred_top_down[level_idx - 1](l_pred)
+                    td_pred_up = self._upsample(td_pred, seq)
+                    current_bottom_up = l1_error + td_pred_up * 0.2
+                
+                higher_errors.extend(l_errors)
+                higher_states.extend(l_states)
+                higher_preds.extend(l_preds)
+                
+                # Tracke Level Error
+                self.level_errors[level_idx] = (l_error ** 2).mean().item()
+                
+                # Level Agreement: Korrelation zwischen Bottom-Up und Top-Down
+                if level_idx > 0:
+                    td_signal = self.pred_top_down[level_idx - 1](l_pred)
+                    bu_norm = bu_input / (bu_input.norm(dim=-1, keepdim=True) + 1e-8)
+                    td_norm = td_signal / (td_signal.norm(dim=-1, keepdim=True) + 1e-8)
+                    agreement = (bu_norm * td_norm).sum(dim=-1).mean().item()
+                    self.level_agreement[level_idx] = 0.9 * self.level_agreement[level_idx] + 0.1 * agreement
+            
+            # ——— Finale Prediction: Level 1 Prediction + Top-Down Korrektur ———
+            # Die finale Prediction ist die Level 1 Prediction, moduliert durch höhere Ebenen
+            mixed_pred = l1_pred
+            
+            # Top-Down Modulation von Level 2 und 3 in finale Prediction einweben
+            if self.n_levels > 1:
+                td_from_level2 = self.pred_top_down[0](higher_preds[-1])  # Letzte Prediction von Level 2
+                td_from_level2_up = self._upsample(td_from_level2, seq)
+                mixed_pred = mixed_pred + td_from_level2_up * 0.1
+            
+            if self.n_levels > 2:
+                td_from_level3 = self.pred_top_down[1](higher_preds[-1])  # Von Level 3
+                td_from_level3_up = self._upsample(td_from_level3, seq)
+                # Erst hoch zu Level 2 Dim, dann zu Level 1 Dim
+                td_from_level3_up = self.pred_top_down[0](td_from_level3_up)
+                mixed_pred = mixed_pred + td_from_level3_up * 0.05
+            
+            # Self-Model Error Tracking (für Kompatibilität mit CogLang.learn)
+            self_model_errors = l1_errors + higher_errors
+            
+            return self_model_errors, l1_states + higher_states, l1_preds + higher_preds, mixed_pred
+    
+    def reset_states(self, batch_size=1, device='cpu'):
+        for stack in self.stacks:
+            stack.reset_states(batch_size, device)
+    
+    def get_level_report(self):
+        """Gibt Metriken pro Ebene zurück."""
+        return {
+            'level_errors': [f'{e:.3f}' for e in self.level_errors.tolist()],
+            'level_agreement': [f'{a:.3f}' for a in self.level_agreement.tolist()],
+            'level_dims': self.level_dims,
+            'n_levels': self.n_levels,
+        }
+
+
 class OutputDecoder(CogModule):
     def __init__(self, d_sparse, d_model, vocab_size):
         super().__init__()
@@ -1771,6 +2034,24 @@ class CogLang:
         m = PredictiveStack(d_model, n_layers, d_state, d_context, n_attention_heads); self.modules.append(m); self._stack = m
         for layer in m.layers: layer._lr = lr
         return m
+    
+    def HierarchicalPC(self, d_model, n_levels=3, n_layers_per_level=None, d_state=64, d_context=128, lr=0.05, n_attention_heads=4):
+        """PHASE 35: Hierarchical Predictive Coding — Mehr-Ebenen-Architektur."""
+        if n_layers_per_level is None:
+            n_layers_per_level = [6, 4, 2]
+        m = HierarchicalPC(d_model, n_levels, n_layers_per_level, d_state, d_context, n_attention_heads)
+        self.modules.append(m)
+        self._stack = m  # Ersetzt PredictiveStack — kompatibel!
+        # Setze LR für alle Layer in allen Ebenen
+        for stack in m.stacks:
+            for layer in stack.layers:
+                layer._lr = lr
+        # Auch Bottom-Up Encoder und Top-Down Predictor LRs setzen
+        for enc in m.enc_bottom_up:
+            enc.weight.data.mul_(0.1)  # Kleine Init
+        for pred in m.pred_top_down:
+            pred.weight.data.mul_(0.1)
+        return m
     def OutputDecoder(self, d_sparse, d_model, vocab_size, lr=0.05):
         m = OutputDecoder(d_sparse, d_model, vocab_size); self.modules.append(m); self._decoder = m
         m._lr = lr; return m
@@ -1869,10 +2150,16 @@ class CogLang:
             # Expand to sequence length
             memory_retrieved = memory_retrieved.expand(-1, seq, -1)
         
-        errors, states, predictions = self._stack(sparse_x, context, memory_retrieved=memory_retrieved, errors_for_attn=sparse_x, learn=learn)
-        # NaN-Guard: Sichere Predictions
-        predictions = [torch.nan_to_num(p, nan=0.0, posinf=1.0, neginf=-1.0) for p in predictions]
-        pred = self._stack.mixed_prediction(predictions)
+        # PHASE 35: HierarchicalPC gibt 4 Werte zurück (errors, states, preds, mixed_pred)
+        # PredictiveStack gibt 3 Werte zurück (errors, states, preds)
+        stack_result = self._stack(sparse_x, context, memory_retrieved=memory_retrieved, errors_for_attn=sparse_x, learn=learn)
+        if len(stack_result) == 4:
+            errors, states, predictions, pred = stack_result
+        else:
+            errors, states, predictions = stack_result
+            # NaN-Guard: Sichere Predictions
+            predictions = [torch.nan_to_num(p, nan=0.0, posinf=1.0, neginf=-1.0) for p in predictions]
+            pred = self._stack.mixed_prediction(predictions)
         
         # PHASE 14: SkillModule transformation - modulates hidden state BEFORE decoder
         # SkillModule arbeitet auf d_sparse-Dimension (pred), nicht auf vocab-Logits
@@ -1885,7 +2172,11 @@ class CogLang:
         if self._bridge is not None:
             output = self._bridge(output, context_embedding=sparse_x)
             
-        return output, {'errors': errors, 'predictions': predictions, 'hidden': hidden, 'pred': pred, 'sparse': sparse_x, 'output': output}
+        # PHASE 35: HierarchicalPC Level Report
+        info_extra = {}
+        if hasattr(self._stack, 'get_level_report'):
+            info_extra['level_report'] = self._stack.get_level_report()
+        return output, {'errors': errors, 'predictions': predictions, 'hidden': hidden, 'pred': pred, 'sparse': sparse_x, 'output': output, **info_extra}
 
     def learn(self, input_ids):
         with torch.no_grad():
@@ -2056,12 +2347,31 @@ class CogLang:
         return ctx
 
 
-def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4, n_rules=16, es_population=8, n_skills=8, use_mixed_precision=True):
-    """Anima in CogLang v3 — Vollständige AGI Architecture mit allen 14 Phasen + Efficiency."""
+def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_layers=8, d_state=256, d_context=512, lr=0.05, memory_size=64, n_attention_heads=4, n_rules=16, es_population=8, n_skills=8, use_mixed_precision=True, hierarchical_pc=False, hp_n_levels=3, hp_layers_per_level=None):
+    """Anima in CogLang v3 — Vollständige AGI Architecture mit allen Phasen + Efficiency.
+    
+    Args:
+        hierarchical_pc: PHASE 35 — Wenn True, nutze HierarchicalPC statt PredictiveStack
+        hp_n_levels: Anzahl Hierarchie-Ebenen
+        hp_layers_per_level: Liste mit Layer-Anzahl pro Ebene (z.B. [6, 4, 2])
+    """
     brain = CogLang(use_mixed_precision=use_mixed_precision)
     brain.SensoryInput(vocab_size=vocab_size, d_model=d_model)
     brain.SparseEncoder(input_dim=d_model, d_sparse=d_sparse, sparsity=0.02)
-    brain.PredictiveStack(d_model=d_sparse, n_layers=n_layers, d_state=d_state, d_context=d_context, lr=lr, n_attention_heads=n_attention_heads)
+    
+    if hierarchical_pc:
+        # PHASE 35: Hierarchical Predictive Coding
+        if hp_layers_per_level is None:
+            hp_layers_per_level = [6, 4, 2]
+        brain.HierarchicalPC(d_model=d_sparse, n_levels=hp_n_levels,
+                            n_layers_per_level=hp_layers_per_level,
+                            d_state=d_state, d_context=d_context,
+                            lr=lr, n_attention_heads=n_attention_heads)
+        print(f'[ARCH] Hierarchical PC aktiv: {hp_n_levels} Ebenen ({", ".join(str(x) for x in hp_layers_per_level)} Layer)')
+    else:
+        # Standard: Flat PredictiveStack
+        brain.PredictiveStack(d_model=d_sparse, n_layers=n_layers, d_state=d_state, d_context=d_context, lr=lr, n_attention_heads=n_attention_heads)
+    
     brain.OutputDecoder(d_sparse=d_sparse, d_model=d_model, vocab_size=vocab_size, lr=lr)
     brain.EpisodicMemory(d_model=d_sparse, memory_size=memory_size, target_dim=d_state)
     brain.ActiveInference(d_model=d_sparse, n_domains=4)

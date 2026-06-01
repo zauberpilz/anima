@@ -798,6 +798,7 @@ def run_evolution():
                             'multi_task_aux': loss_components.get('aux_loss', 0),
                             # PHASE 33: Active Inference Report
                             'active_inference': brain.get_active_inference_report() if hasattr(brain, 'get_active_inference_report') else {},
+                            'level_report': info.get('level_report', {}),
                         }
                         with open('/home/anima/train_state.json', 'w') as sf:
                             json.dump(state, sf)

@@ -444,11 +444,12 @@ class EpisodicMemory(CogModule):
         
         # dW_read = error^T @ attention  (beide auf batch-Dimension, passt!)
         dw_read = e_flat.T @ att  # [d_model, batch] @ [batch, memory_size] = [d_model, memory_size]
+        # dw_read shape = [d_model, memory_size] = W_read.weight.shape
         if self.W_read.weight not in self._momentum:
-            self._momentum[self.W_read.weight] = dw_read.T.clone()
+            self._momentum[self.W_read.weight] = dw_read.clone()
         else:
             m = self._momentum_factor
-            self._momentum[self.W_read.weight] = m * self._momentum[self.W_read.weight] + (1 - m) * dw_read.T
+            self._momentum[self.W_read.weight] = m * self._momentum[self.W_read.weight] + (1 - m) * dw_read
         self.W_read.weight.data.add_(self._momentum[self.W_read.weight], alpha=self._lr * 0.1)
         self.W_read.weight.data.clamp_(-1.0, 1.0)
 

@@ -1352,7 +1352,7 @@ class ActiveInference(CogModule):
             # ——— 11. Curiosity Factor ———
             # Wenn wir viel lernen (hoher info_gain): höhere LR
             # Wenn wir nichts lernen: niedrigere LR (conservation mode)
-            avg_recent_reward = self.rewards_history.mean().item() if hasattr(self, 'reward_history') else 0.0
+            avg_recent_reward = self.reward_history.mean().item() if hasattr(self, 'reward_history') else 0.0
             curiosity_factor = 0.5 + self.curiosity_drive.item() * avg_recent_reward
             curiosity_factor = max(0.3, min(3.0, curiosity_factor))
             
@@ -1453,14 +1453,15 @@ class SleepReplay(CogModule):
                 
                 # Speichere ersten Sequenzabschnitt (max 128 Tokens)
                 seq = input_ids[b, :min(128, input_ids.size(1))]
-                self.replay_inputs[idx, :len(seq)] = seq[:128]
-                self.replay_errors[idx] = error_norm
-                self.replay_domains[idx] = domain_idx
-                self.replay_weights[idx] = importance
+                self.replay_inputs[idx, :len(seq)] = seq[:128].to(dtype=torch.long)
+                self.replay_errors[idx] = float(min(error_norm, 1e4))
+                self.replay_domains[idx] = int(domain_idx)
+                self.replay_weights[idx] = float(min(importance, 1e4))
                 self.replay_age[idx] = 0
                 
                 # Pattern: höherer Error + höhere Importance = stärkeres Pattern
-                self.pattern_strength[idx] = error_norm * importance
+                val = error_norm * importance
+                self.pattern_strength[idx] = float(min(val, 1e4))  # Überlaufschutz
                 self.pattern_age[idx] = 0
                 
                 self._replay_idx += 1
@@ -2187,7 +2188,7 @@ class SelfReflection(CogModule):
                 contradiction_risk = 0.0
             
             # ——— 4. Previous State Consistency (über Generation hinweg) ———
-            if prev_hidden is not None:
+            if prev_hidden is not None and prev_hidden.size(0) == hidden_states.size(0):
                 # Vergleiche ersten aktuellen State mit letztem vorherigen State
                 pair = torch.cat([prev_hidden, hidden_states[:, 0, :]], dim=-1)
                 gen_consistency = torch.sigmoid(self.consistency_net(pair)).mean().item()
@@ -4200,6 +4201,8 @@ class CogLang:
             predictions = [torch.nan_to_num(p, nan=0.0, posinf=1.0, neginf=-1.0) for p in predictions]
             pred = self._stack.mixed_prediction(predictions)
         
+        info_extra = {}
+        
         # PHASE 42: Consciousness Glimpse — Global Workspace Broadcasting
         if self._consciousness is not None and errors is not None:
             # Berechne Salience aus Hidden-States und Prediction Errors
@@ -4213,8 +4216,6 @@ class CogLang:
         # SkillModule arbeitet auf d_sparse-Dimension (pred), nicht auf vocab-Logits
         if self._skills is not None:
             pred = self._skills(pred, context=sparse_x)
-        
-        info_extra = {}
         
         # PHASE 38: Knowledge Graph — Retrieve relevant knowledge and condition
         if self._knowledge_graph is not None:
@@ -4296,7 +4297,7 @@ class CogLang:
             prev_hidden = getattr(self, '_prev_hidden', None)
             reflection = self._self_reflection(pred, output, prev_hidden=prev_hidden)
             info_extra['reflection'] = reflection
-            self._prev_hidden = pred[:, -1:, :].detach()
+            self._prev_hidden = pred[:, -1:, :].squeeze(1).detach()  # [batch, d_model]
         
         # PHASE 39: Tool Use — Erkenne und führe Tool-Aufrufe aus
         if self._tool_use is not None and not learn:
@@ -4376,7 +4377,12 @@ class CogLang:
             
             # PHASE 34: SleepReplay — Speichere Erfahrung im Replay Buffer
             if self._sleep_replay is not None:
-                error_norm = sum((e ** 2).mean().item() for e in info['errors']) / len(info['errors'])
+                error_norms = []
+                for e in info['errors']:
+                    en = (e ** 2).mean().item()
+                    en = 0.0 if torch.isnan(torch.tensor(en)) or torch.isinf(torch.tensor(en)) else en
+                    error_norms.append(en)
+                error_norm = sum(error_norms) / max(1, len(error_norms))
                 domain_idx = getattr(self, '_current_domain', 0)
                 importance = 1.0 + error_norm * 0.5  # Höherer Error = wichtiger
                 self._sleep_replay.store(input_ids, error_norm, domain_idx=domain_idx, importance=importance)

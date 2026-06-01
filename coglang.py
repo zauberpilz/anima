@@ -4764,6 +4764,329 @@ class ExplorationDrive(CogModule):
         }
 
 
+class MetaKognition(CogModule):
+    """
+    PHASE 48: MetaKognition — Das Modell denkt über sein eigenes Denken nach.
+    
+    Während SelfReflection (Phase 37) den Output bewertet, steuert MetaKognition
+    den kognitiven Prozess selbst:
+    
+    1. StrategySelector — Wählt optimale Reasoning-Strategie basierend auf Task
+    2. ConfidenceCalibrator — Kalibriert Confidence-Scores (Temperature Scaling)
+    3. CognitiveResourceAllocator — Verteilt Rechenbudget dynamisch
+    
+    Inspiriert von:
+    - Metacognition in der Psychologie (Flavell 1979)
+    - System-1/System-2-Steuerung (Kahneman)
+    - Adaptive Computation Time (Graves 2016)
+    """
+    def __init__(self, d_model, n_strategies=4, n_resource_levels=3):
+        super().__init__()
+        self.d_model = d_model
+        self.n_strategies = n_strategies
+        self.n_resource_levels = n_resource_levels
+        
+        # ——— 1. Strategy Selector ———
+        # Wählt aus 4 Strategien: 
+        #   0 = schnelle Heuristik (System-1-only)
+        #   1 = balanciert (etwas Reasoning)
+        #   2 = tiefes Reasoning (viele CoT-Schritte)
+        #   3 = explorativ (breite Trees, Imagination, Curiosity)
+        self.strategy_encoder = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Tanh(),
+            nn.Linear(d_model, n_strategies),
+        )
+        self.strategy_confidence = nn.Linear(d_model, 1)  # Vertrauen in gewählte Strategie
+        
+        # ——— Task Difficulty Estimator ———
+        # Schätzt Schwierigkeit aus Embedding + bisherigem Loss
+        self.difficulty_estimator = nn.Sequential(
+            nn.Linear(d_model + 1, d_model // 2),
+            nn.Tanh(),
+            nn.Linear(d_model // 2, 1),
+        )
+        
+        # ——— 2. Confidence Calibrator ———
+        # Temperature-Scale: calibrated_conf = sigmoid(raw_conf / temperature)
+        self.register_buffer('calibration_temperature', torch.tensor(1.0))
+        self.register_buffer('calibration_bias', torch.tensor(0.0))
+        # ECE-Tracking (Expected Calibration Error)
+        self.register_buffer('ece_history', torch.zeros(500))
+        self._ece_idx = 0
+        
+        # ——— 3. Cognitive Resource Allocator ———
+        # Entscheidet für jedes Modul, wie viele Ressourcen es bekommt
+        # n_reasoning_steps, n_tree_branches, n_plan_steps, n_imagination_steps
+        self.resource_allocator = nn.Sequential(
+            nn.Linear(d_model + 1, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, n_resource_levels * 4),  # 4 resource dimensions
+        )
+        # Resource-Namen
+        self.resource_names = ['reasoning_steps', 'tree_branches', 'plan_steps', 'imagination_steps']
+        # Resource-Bereiche pro Level
+        self.resource_ranges = {
+            'reasoning_steps': [2, 6, 12],
+            'tree_branches': [1, 3, 5],
+            'plan_steps': [2, 4, 8],
+            'imagination_steps': [1, 3, 6],
+        }
+        
+        # ——— Strategy Memory ———
+        # Trackt, welche Strategie bei welchem Task-Typ gut funktioniert hat
+        self.register_buffer('strategy_success', torch.zeros(1000, n_strategies))
+        self.register_buffer('strategy_count', torch.zeros(1000, n_strategies))
+        self._strategy_mem_idx = 0
+        
+        # ——— Cognitive Load Tracking ———
+        self.register_buffer('cognitive_load', torch.zeros(50))  # Letzte 50 Load-Werte
+        self._load_idx = 0
+        self._current_strategy = 0  # Zuletzt gewählte Strategie
+        
+        self._max_weight = 2.0
+    
+    def estimate_difficulty(self, hidden_states, current_loss=None):
+        """
+        Schätze Task-Schwierigkeit aus Hidden-States + optionalem Loss.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            current_loss: float oder None
+            
+        Returns:
+            difficulty: [batch, 1] — Schwierigkeit 0..1
+        """
+        with torch.no_grad():
+            # Pool über Sequenz
+            pooled = hidden_states.mean(dim=1)  # [batch, d_model]
+            
+            # Loss als Feature
+            loss_feat = torch.zeros(pooled.size(0), 1, device=pooled.device)
+            if current_loss is not None:
+                loss_feat.fill_(min(current_loss, 20.0) / 20.0)  # Normalisiert auf 0..1
+            
+            diff_input = torch.cat([pooled, loss_feat], dim=-1)  # [batch, d_model+1]
+            difficulty = torch.sigmoid(self.difficulty_estimator(diff_input))  # [batch, 1]
+            
+            return difficulty
+    
+    def select_strategy(self, hidden_states, difficulty, context_embedding=None):
+        """
+        Wähle optimale kognitive Strategie basierend auf Task und Kontext.
+        
+        Args:
+            hidden_states: [batch, seq, d_model] — Aktuelle Repräsentation
+            difficulty: [batch, 1] — Geschätzte Schwierigkeit
+            context_embedding: [batch, d_model] oder None — Zusätzlicher Kontext
+            
+        Returns:
+            strategy_weights: [batch, n_strategies] — Softmax-gewichtete Strategie
+            selected: [batch] — Argmax-Strategie
+            confidence: [batch] — Vertrauen in die Wahl
+        """
+        with torch.no_grad():
+            batch = hidden_states.size(0)
+            
+            # Pooled Embedding
+            pooled = hidden_states.mean(dim=1)  # [batch, d_model]
+            
+            # Strategy Features: Embedding + Difficulty
+            if context_embedding is not None:
+                features = torch.cat([pooled + context_embedding, difficulty], dim=-1)
+            else:
+                features = torch.cat([pooled, difficulty.expand(-1, d_model if False else 1)], dim=-1)
+            
+            # Erweitere auf d_model*2 falls nötig
+            if features.size(-1) < self.d_model * 2:
+                pad = torch.zeros(batch, self.d_model * 2 - features.size(-1), device=features.device)
+                features = torch.cat([features, pad], dim=-1)
+            
+            strategy_logits = self.strategy_encoder(features)  # [batch, n_strategies]
+            strategy_weights = F.softmax(strategy_logits, dim=-1)
+            selected = strategy_weights.argmax(dim=-1)  # [batch]
+            
+            # Confidence in strategy choice
+            conf_raw = self.strategy_confidence(pooled)  # [batch, 1]
+            strategy_confidence = torch.sigmoid(conf_raw).squeeze(-1)  # [batch]
+            
+            self._current_strategy = selected[0].item()
+            
+            return strategy_weights, selected, strategy_confidence
+    
+    def calibrate_confidence(self, raw_confidence, method='temperature'):
+        """
+        Kalibriere rohe Confidence-Scores.
+        
+        Args:
+            raw_confidence: [batch, seq, 1] — Rohe Sigmoid-Werte aus SelfReflection
+            method: 'temperature' oder 'platt' oder 'beta'
+            
+        Returns:
+            calibrated: [batch, seq, 1] — Kalibrierte Confidence
+        """
+        with torch.no_grad():
+            if method == 'temperature':
+                # Temperature Scaling: logit / T
+                eps = 1e-6
+                raw_conf = raw_confidence.clamp(eps, 1.0 - eps)
+                logits = torch.log(raw_conf / (1.0 - raw_conf))  # Inverse sigmoid
+                T = self.calibration_temperature.clamp(0.1, 10.0)
+                calibrated = torch.sigmoid(logits / T + self.calibration_bias)
+            elif method == 'platt':
+                # Platt Scaling: sigmoid(a * logit + b)
+                raw_conf = raw_confidence.clamp(1e-6, 1.0 - 1e-6)
+                logits = torch.log(raw_conf / (1.0 - raw_conf))
+                a = self.calibration_temperature.clamp(0.1, 5.0)
+                b = self.calibration_bias
+                calibrated = torch.sigmoid(a * logits + b)
+            else:
+                calibrated = raw_confidence
+            
+            return calibrated
+    
+    def allocate_resources(self, hidden_states, difficulty):
+        """
+        Weise kognitive Ressourcen basierend auf Schwierigkeit zu.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            difficulty: [batch, 1]
+            
+        Returns:
+            resources: dict mit resource_name -> level (int)
+        """
+        with torch.no_grad():
+            pooled = hidden_states.mean(dim=1)  # [batch, d_model]
+            
+            # Loss-Feature append (0 wenn keiner verfügbar)
+            loss_feat = torch.zeros(pooled.size(0), 1, device=pooled.device)
+            alloc_in = torch.cat([pooled, loss_feat + difficulty], dim=-1)  # [batch, d_model+1]
+            
+            raw_alloc = self.resource_allocator(alloc_in)  # [batch, n_resource_levels*4]
+            
+            # Reshape: [batch, 4, n_resource_levels]
+            raw_alloc = raw_alloc.view(-1, 4, self.n_resource_levels)  # [batch, 4, 3]
+            alloc_probs = F.softmax(raw_alloc, dim=-1)  # [batch, 4, 3]
+            
+            # Wähle Level pro Resource
+            resources = {}
+            for i, name in enumerate(self.resource_names):
+                level = alloc_probs[:, i, :].argmax(dim=-1)  # [batch]
+                # Batch-Mean für einfache Handhabung
+                avg_level = level.float().mean().round().int().clamp(0, self.n_resource_levels - 1)
+                level_idx = avg_level.item()
+                resources[name] = self.resource_ranges[name][level_idx]
+            
+            # Cognitive Load = Summe aller Ressourcen-Nutzung
+            total_load = sum(resources.values()) / sum(max(r) for r in self.resource_ranges.values())
+            self.cognitive_load[self._load_idx % 50] = total_load
+            self._load_idx += 1
+            
+            return resources
+    
+    def update_strategy_memory(self, strategy_id, success_score):
+        """
+        Lerne: Wie gut hat Strategie `strategy_id` funktioniert?
+        
+        Args:
+            strategy_id: int (0..n_strategies-1)
+            success_score: float (0..1) — 1 = sehr gut, 0 = schlecht
+        """
+        idx = self._strategy_mem_idx % 1000
+        self.strategy_success[idx] = 0
+        self.strategy_success[idx, strategy_id] = success_score
+        self.strategy_count[idx] = 0
+        self.strategy_count[idx, strategy_id] = 1
+        self._strategy_mem_idx += 1
+    
+    def update_calibration(self, confidence, correctness):
+        """
+        Aktualisiere Kalibrierung basierend auf Confidence vs. Correctness.
+        
+        Args:
+            confidence: float (0..1) — Vorhergesagte Confidence
+            correctness: float (0..1) — Tatsächliche Korrektheit (1 = richtig)
+        """
+        with torch.no_grad():
+            # ECE: |confidence - correctness|
+            ece = abs(confidence - correctness)
+            self.ece_history[self._ece_idx % 500] = ece
+            self._ece_idx += 1
+            
+            # Temperature-Update: Wenn wir overconfident sind (conf > corr), erhöhe T
+            if confidence > correctness + 0.1:
+                # Overconfident → mehr Streuung (höhere Temperatur)
+                self.calibration_temperature *= 1.01
+            elif confidence < correctness - 0.1:
+                # Underconfident → weniger Streuung (niedrigere Temperatur)
+                self.calibration_temperature *= 0.99
+            
+            # Bias-Update
+            bias_delta = 0.01 * (correctness - confidence)
+            self.calibration_bias += bias_delta
+            
+            # Clamp
+            self.calibration_temperature.clamp_(0.1, 10.0)
+            self.calibration_bias.clamp_(-2.0, 2.0)
+    
+    def get_meta_strategy_advice(self, hidden_states, current_loss=None):
+        """
+        Gib Strategie-Empfehlung für den aktuellen Forward-Pass.
+        
+        Returns:
+            dict mit Strategy-Advice
+        """
+        with torch.no_grad():
+            difficulty = self.estimate_difficulty(hidden_states, current_loss)
+            # Difficulty 0..1
+            
+            # Einfache Heuristik für Strategie-Wahl
+            diff_val = difficulty.mean().item()
+            
+            if diff_val < 0.3:
+                strategy = 0  # Schnelle Heuristik
+            elif diff_val < 0.6:
+                strategy = 1  # Balanciert
+            elif diff_val < 0.8:
+                strategy = 2  # Tiefes Reasoning
+            else:
+                strategy = 3  # Explorative Suche
+            
+            resources = self.allocate_resources(hidden_states, difficulty)
+            
+            return {
+                'difficulty': diff_val,
+                'strategy': strategy,
+                'strategy_name': ['fast', 'balanced', 'deep', 'explorative'][strategy],
+                'resources': resources,
+                'calibration_temperature': self.calibration_temperature.item(),
+                'avg_ece': self.ece_history[:max(1, self._ece_idx)].mean().item(),
+            }
+    
+    def get_metakognition_stats(self):
+        """Gib MetaKognitions-Statistiken."""
+        avg_ece = self.ece_history[:max(1, self._ece_idx)].mean().item()
+        avg_load = self.cognitive_load[:max(1, self._load_idx)].mean().item()
+        
+        # Strategie-Erfolgsrate
+        total_trials = self.strategy_count.sum().item()
+        total_success = self.strategy_success.sum().item()
+        if total_trials > 0:
+            success_rate = total_success / total_trials
+        else:
+            success_rate = 0.0
+        
+        return {
+            'avg_ece': avg_ece,
+            'cognitive_load': avg_load,
+            'calibration_temp': self.calibration_temperature.item(),
+            'current_strategy': self._current_strategy,
+            'strategy_success_rate': success_rate,
+            'n_strategies': self.n_strategies,
+        }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -4792,6 +5115,7 @@ class CogLang:
         self._system2_reasoning = None
         self._imagination = None
         self._exploration = None
+        self._metakognition = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -4888,6 +5212,10 @@ class CogLang:
     def ExplorationDrive(self, d_model, n_uncertainty_cells=128, n_emn_history=200):
         """PHASE 47: Exploration Drive — Aktive Wissenslücken-Suche & Neugier."""
         m = ExplorationDrive(d_model, n_uncertainty_cells, n_emn_history); self.modules.append(m); self._exploration = m; return m
+
+    def MetaKognition(self, d_model, n_strategies=4, n_resource_levels=3):
+        """PHASE 48: MetaKognition — Strategie-Selektion, Confidence-Kalibrierung, Resource-Allocation."""
+        m = MetaKognition(d_model, n_strategies, n_resource_levels); self.modules.append(m); self._metakognition = m; return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
         """PHASE 31: Vulnerability Detection Head."""
@@ -5118,6 +5446,44 @@ class CogLang:
             reflection = self._self_reflection(pred, output, prev_hidden=prev_hidden)
             info_extra['reflection'] = reflection
             self._prev_hidden = pred[:, -1:, :].squeeze(1).detach()  # [batch, d_model]
+            
+        # PHASE 48: MetaKognition — Denke über das Denken nach
+        if self._metakognition is not None and not learn:
+            # Strategie-Empfehlung basierend auf aktuellem Hidden-State
+            meta_advice = self._metakognition.get_meta_strategy_advice(pred, 
+                current_loss=getattr(self, '_current_loss', None))
+            info_extra['metakognition'] = meta_advice
+            
+            # Wende Strategie an: moduliere pred mit Meta-Signal
+            if meta_advice['strategy'] == 0:
+                # Fast: kein zusätzliches Processing
+                pass
+            elif meta_advice['strategy'] == 1:
+                # Balanced: leichte Aktivierungs-Skalierung
+                strategy_factor = 0.5 + 0.5 * (1.0 - meta_advice['difficulty'])
+                pred = pred * strategy_factor
+            elif meta_advice['strategy'] == 2:
+                # Deep: verstärke Reasoning-Einfluss
+                strategy_factor = 0.3 + 0.7 * meta_advice['difficulty']
+                pred = pred * strategy_factor
+            elif meta_advice['strategy'] == 3:
+                # Explorative: erhöhe Varianz in Aktivierungen
+                noise = torch.randn_like(pred) * 0.02 * meta_advice['difficulty']
+                pred = pred + noise
+        
+        if self._metakognition is not None and learn:
+            # Im Lernmodus: kalibriere Confidence aus Reflection
+            reflection = info_extra.get('reflection', {})
+            if reflection and 'avg_confidence' in reflection:
+                raw_conf = reflection['avg_confidence']
+                calibrated = self._metakognition.calibrate_confidence(
+                    torch.tensor(raw_conf).view(1, 1, 1).to(pred.device)
+                )
+                info_extra['metakognition'] = {
+                    'raw_confidence': raw_conf,
+                    'calibrated_confidence': calibrated.mean().item(),
+                    'calibration_temp': self._metakognition.calibration_temperature.item(),
+                }
         
         # PHASE 39: Tool Use — Erkenne und führe Tool-Aufrufe aus
         if self._tool_use is not None and not learn:
@@ -5226,6 +5592,22 @@ class CogLang:
                 reflection = info.get('reflection')
                 if reflection:
                     self._self_reflection.learn_step(reflection, loss.item())
+                    
+            # PHASE 48: MetaKognition learn_step — Kalibrierung + Strategie-Lernen
+            if self._metakognition is not None:
+                reflection = info.get('reflection', {})
+                meta_info = info.get('metakognition', {})
+                if reflection and 'avg_confidence' in reflection:
+                    raw_conf = reflection['avg_confidence']
+                    # Correctness: niedriger Loss = korrekt
+                    correctness = max(0.0, 1.0 - min(loss.item(), 10.0) / 10.0)
+                    self._metakognition.update_calibration(raw_conf, correctness)
+                
+                if meta_info and 'strategy' in meta_info:
+                    # Strategie-Erfolg: Loss runter = erfolgreich
+                    strategy_id = meta_info['strategy']
+                    success_score = max(0.0, 1.0 - min(loss.item(), 20.0) / 20.0)
+                    self._metakognition.update_strategy_memory(strategy_id, success_score)
             
             # PHASE 40: Multi-Agent learn_step — lerne aus Debattenergebnissen
             if self._multi_agent is not None:
@@ -5270,6 +5652,7 @@ class CogLang:
             
             if torch.isnan(loss) or torch.isinf(loss):
                 return 100.0, info
+            self._current_loss = loss.item()
         return loss.item(), info
     
     def ewc_snapshot_all(self):
@@ -5529,6 +5912,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.System2Reasoning(d_model=d_sparse, n_reasoning_steps=8, n_tree_branches=3, temperature=0.3)
     brain.ImaginationPlanning(d_model=d_sparse, n_plan_steps=6, n_actions=16, temperature=0.2)
     brain.ExplorationDrive(d_model=d_sparse, n_uncertainty_cells=128, n_emn_history=200)
+    brain.MetaKognition(d_model=d_sparse, n_strategies=4, n_resource_levels=3)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

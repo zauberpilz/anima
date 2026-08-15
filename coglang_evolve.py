@@ -6,6 +6,31 @@ from coglang import build_anima, AsyncDataLoader, DynamicBatchSizer
 from data_loader import MultiDomainDataset, get_large_dataset, get_mixed_dataset
 from training_controller import TrainingController
 
+
+def _jsonable(obj):
+    """Rekursiv JSON-serialisierbar machen (Tensor/numpy -> float, Sonstiges -> str).
+    Fix: train_state.json brach bisher an Torch-Tensoren in Modul-Stats (z.B. reflection)."""
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if obj is None or isinstance(obj, (bool, int, str)):
+        return obj
+    if isinstance(obj, float):
+        return float(obj)
+    # Torch-Tensor / numpy-Skalare
+    if hasattr(obj, 'item'):
+        try:
+            return _jsonable(obj.item())
+        except Exception:
+            return str(obj)
+    # Alles andere: versuchen zu serialisieren, sonst stringifizieren
+    try:
+        json.dumps(obj)
+        return obj
+    except Exception:
+        return str(obj)
+
 # Clean directory paths
 CHECKPOINT_DIR = '/home/anima/checkpoints'
 CONFIG_FILE = '/home/anima/evolution_config.json'
@@ -576,6 +601,21 @@ def run_evolution():
                     for d in domain_weights:
                         domain_weights[d] /= total_w
 
+            # PHASE 56: Active Learning — Unsicherheits-basierte Domain-Gewichtung
+            # Domänen mit hoher Unsicherheit bekommen mehr Daten (Uncertainty Sampling)
+            if hasattr(brain, '_active_learning') and brain._active_learning is not None:
+                al_prefs = brain._active_learning.get_domain_preference()  # [n_domains]
+                al_blend = min(0.2, 0.02 + step / steps_per_iter * 0.18)
+                domain_names = ['text', 'code', 'security', 'network']
+                for i, d in enumerate(domain_names):
+                    if d in domain_weights:
+                        domain_weights[d] = (1 - al_blend) * domain_weights[d] + al_blend * al_prefs[i].item()
+                # Renormalize
+                total_w = sum(domain_weights.values())
+                if total_w > 0:
+                    for d in domain_weights:
+                        domain_weights[d] /= total_w
+
             # -----------------------------------------------------------------
             #  PHASE 30: Get batch with smooth domain blending
             # -----------------------------------------------------------------
@@ -874,9 +914,11 @@ def run_evolution():
                             'hierarchical_goal': brain._hierarchical_goal.get_goal_stats() if hasattr(brain, '_hierarchical_goal') and brain._hierarchical_goal is not None else {},
                             # PHASE 55: Meta-Learning Stats
                             'meta_learning': brain._meta_learning.get_meta_stats() if hasattr(brain, '_meta_learning') and brain._meta_learning is not None else {},
+                            # PHASE 56: Active Learning Stats
+                            'active_learning': brain._active_learning.get_active_stats() if hasattr(brain, '_active_learning') and brain._active_learning is not None else {},
                         }
                         with open('/home/anima/train_state.json', 'w') as sf:
-                            json.dump(state, sf)
+                            json.dump(_jsonable(state), sf)
                     except Exception:
                         pass
 

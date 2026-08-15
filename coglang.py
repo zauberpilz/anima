@@ -637,7 +637,7 @@ class PredictiveLayer(CogModule):
         self.register_buffer('state', state_init)
         self.register_buffer('error_trace', torch.zeros(1, d_model))
 
-    def forward(self, x, context=None, memory_retrieved=None, learn=True):
+    def forward(self, x, context=None, memory_retrieved=None, learn=True, token_weights=None):
         with torch.no_grad():
             batch, seq, d = x.shape
             device = x.device
@@ -667,8 +667,16 @@ class PredictiveLayer(CogModule):
                 if torch.isnan(error).any() or torch.isinf(error).any():
                     error = torch.nan_to_num(error, nan=0.0, posinf=1.0, neginf=-1.0)
                 
+                # PHASE 58: Knowledge-Gap-gewichtet — Wissenslücken-Tokens
+                # bekommen stärkere Hebbian-Updates (aktives Lernen auf Token-Ebene).
+                # Nur das Haupt-Update (W_pred) wird skaliert; der zurückgegebene
+                # Fehler bleibt unverändert, damit Module-Statistiken konsistent bleiben.
+                update_error = error
+                if token_weights is not None:
+                    update_error = error * token_weights
+                
                 # W_pred: NLMS Hebbian (hat eigenen NaN-Guard)
-                self._hebbian(error, inp, self.W_pred.weight, lr_eff)
+                self._hebbian(update_error, inp, self.W_pred.weight, lr_eff)
                 
                 # W_error: Adaptive LMS Hebbian
                 delta = self.W_error(error)
@@ -849,12 +857,12 @@ class PredictiveStack(CogModule):
         # PHASE 6: Self-Model
         self.self_model = SelfModel(d_model, n_layers)
 
-    def forward(self, x, context=None, memory_retrieved=None, errors_for_attn=None, learn=True):
+    def forward(self, x, context=None, memory_retrieved=None, errors_for_attn=None, learn=True, token_weights=None):
         errors, states, preds = [], [], []
         current = x
         for i, layer in enumerate(self.layers):
             mem = memory_retrieved if i == 0 else None
-            s, e, p = layer(current, context, memory_retrieved=mem, learn=learn)
+            s, e, p = layer(current, context, memory_retrieved=mem, learn=learn, token_weights=token_weights)
             errors.append(e); states.append(s); preds.append(p)
             
             # PHASE 11: Hebbian Attention als primäre Attention
@@ -6581,6 +6589,37 @@ class ActiveLearning(CogModule):
     #  2. QUERY MECHANISMUS
     # =========================================================================
     
+    def get_token_weights(self, input_ids, max_boost=2.0):
+        """
+        PHASE 58: Token-Gewichte für Hebbian-Updates.
+        
+        Tokens mit hoher Wissenslücken-Unsicherheit (wenig gelernt) bekommen
+        stärkere Hebbian-Updates — das Modell lernt gezielt seine Wissenslücken.
+        Nur Tokens mit genug Daten (counts > 5) werden gewichtet; unbekannte
+        Tokens bleiben bei Gewicht 1.0 (kein Verzerren des Lernens).
+        
+        Args:
+            input_ids: [batch, seq] — Tokens des aktuellen Batches
+            max_boost: float — maximale Gewichtung (2.0 = doppelt so stark lernen)
+        
+        Returns:
+            weights: [batch, seq, 1] — per-Token Gewichte (1.0..max_boost)
+        """
+        with torch.no_grad():
+            max_tok = self.token_uncertainty.size(0) - 1
+            tok = input_ids.reshape(-1).clamp(max=max_tok)
+            counts = self.token_counts[tok]
+            unc = self.token_uncertainty[tok]
+            
+            # Nur Tokens mit genug Beobachtungen gewichten
+            has_data = counts > 5
+            # Batch-Max als Normalisierung (relative Wissenslücken-Stärke)
+            batch_max = unc.max().clamp(min=1e-6)
+            weight = 1.0 + (max_boost - 1.0) * (unc / batch_max)
+            weight = torch.where(has_data, weight, torch.ones_like(weight))
+            
+            return weight.reshape(input_ids.shape[0], input_ids.shape[1], 1)
+    
     def get_knowledge_gaps(self, top_k=8):
         """
         Finde die unsichersten Tokens = Wissenslücken.
@@ -6903,7 +6942,11 @@ class CogLang:
         
         # PHASE 35: HierarchicalPC gibt 4 Werte zurück (errors, states, preds, mixed_pred)
         # PredictiveStack gibt 3 Werte zurück (errors, states, preds)
-        stack_result = self._stack(sparse_x, context, memory_retrieved=memory_retrieved, errors_for_attn=sparse_x, learn=learn)
+        # PHASE 58: Wissenslücken-gewichtete Hebbian-Updates — nur im Lernmodus
+        token_weights = None
+        if learn and self._active_learning is not None and self._active_learning._uncertainty_idx > 10:
+            token_weights = self._active_learning.get_token_weights(input_ids)
+        stack_result = self._stack(sparse_x, context, memory_retrieved=memory_retrieved, errors_for_attn=sparse_x, learn=learn, token_weights=token_weights)
         if len(stack_result) == 4:
             errors, states, predictions, pred = stack_result
         else:

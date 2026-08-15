@@ -8,7 +8,7 @@
 
 ## Architecture Overview
 
-**34 CogModule classes · 7635 lines (coglang.py) · 58 phases**
+**34 CogModule classes · 7635 lines (coglang.py) · 59 phases**
 
 CogLang v3 is a complete AGI architecture with zero backpropagation. All learning happens via Hebbian rules, predictive coding errors, and local plasticity. The system autonomously evolves through multi-domain BPE data.
 
@@ -104,6 +104,7 @@ CogLang v3 is a complete AGI architecture with zero backpropagation. All learnin
 | 56 | Active Learning | `ActiveLearning` | Self-directed learning: uncertainty sampler, query mechanism, curriculum on demand |
 | 57 | Uncertainty-Coupled Meta-Learning | *(MetaLearning upgrade)* | ActiveLearning uncertainty modulates hyperparameters (conservative LR, more exploration); meta-HPs now applied to real optimizer LR |
 | 58 | Knowledge-Gap Weighted Learning | *(ActiveLearning upgrade)* | Knowledge-gap tokens get stronger Hebbian updates (per-token boost in PredictiveLayer, up to 2x) — targeted learning of unknown vocabulary |
+| 59 | Self-Directed Goal Setting | *(ActiveLearning upgrade)* | Model sets own learning goals from knowledge gaps (top-10 tokens), tracks uncertainty reduction, requests easier data on stagnation (ZPD coupling) |
 
 ---
 

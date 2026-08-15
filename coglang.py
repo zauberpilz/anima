@@ -6504,6 +6504,19 @@ class ActiveLearning(CogModule):
         # ——— Metrik ———
         self.register_buffer('active_sampling_benefit', torch.zeros(window_size))
         self._benefit_idx = 0
+        
+        # =====================================================================
+        #  4. PHASE 59: SELBST-EVALUATIVE ZIELSETZUNG (Self-Directed Goals)
+        # =====================================================================
+        # Das Modell setzt sich aus Wissenslücken eigene Lernziele (Top-10
+        # unsicherste Tokens), trackt deren Fortschritt (Unsicherheits-Abbau)
+        # und fordert bei Stagnation leichtere Daten an (ZPD-Kopplung).
+        self.register_buffer('goals', torch.zeros(10, dtype=torch.long))
+        self.register_buffer('goal_uncertainty_start', torch.zeros(10))
+        self.register_buffer('goal_uncertainty_now', torch.zeros(10))
+        self.register_buffer('goal_request', torch.zeros(1, dtype=torch.long))
+        self._goal_step = 0
+        self._stagnation_steps = 0
     
     # =========================================================================
     #  1. UNCERTAINTY SAMPLING
@@ -6578,6 +6591,12 @@ class ActiveLearning(CogModule):
                 else:
                     self.curriculum_request[0] = 0
                 self.curriculum_ema[0] = 0.9 * ema + 0.1 * avg_recent
+            
+            # PHASE 59: Goal-Stagnations-Signal hat Vorrang vor dem Trend
+            # (Ziele werden nicht gelernt → leichtere Daten, ZPD)
+            goal_req = int(self.goal_request[0].item())
+            if goal_req != 0:
+                self.curriculum_request[0] = goal_req
             
             # Query-Mechanismus zählt aktives Sampling
             self.query_counter[0] += 1
@@ -6659,6 +6678,76 @@ class ActiveLearning(CogModule):
         return int(self.curriculum_request[0].item())
     
     # =========================================================================
+    #  3b. PHASE 59: SELBST-EVALUATIVE ZIELSETZUNG
+    # =========================================================================
+    
+    def update_goals(self):
+        """
+        PHASE 59: Setze eigene Lernziele aus den Wissenslücken und tracke Fortschritt.
+        
+        Alle 50 Steps werden die Top-10 unsichersten Tokens als Lernziele gesetzt.
+        Der Fortschritt misst, wie viel Unsicherheit für jedes Ziel abgebaut wurde.
+        Stagniert der Fortschritt (Ziele werden nicht gelernt), fordert das Modell
+        leichtere Daten an (Kopplung an Curriculum-on-Demand).
+        """
+        with torch.no_grad():
+            self._goal_step += 1
+            if self._goal_step % 50 != 0:
+                return
+            
+            gaps = self.get_knowledge_gaps(10)
+            n_gaps = len(gaps)
+            
+            for i in range(self.goals.size(0)):
+                if i < n_gaps:
+                    tok, unc = gaps[i]
+                else:
+                    tok, unc = 0, 0.0
+                
+                if int(self.goals[i]) != tok:
+                    # Neues Ziel: Startwert einfrieren
+                    self.goals[i] = tok
+                    self.goal_uncertainty_start[i] = unc
+                self.goal_uncertainty_now[i] = unc
+            
+            # Stagnations-Detektion: Durchschnittlicher Ziel-Fortschritt
+            progress = self.get_goal_progress()
+            avg_progress = sum(progress) / max(1, len(progress))
+            if avg_progress < 0.1:
+                self._stagnation_steps += 1
+            else:
+                self._stagnation_steps = 0
+            
+            # Bei anhaltender Stagnation: leichtere Daten anfordern (ZPD)
+            # Signal in goal_request (nicht direkt curriculum_request), damit
+            # learn_step es nicht durch das Trend-Signal überschreibt.
+            if self._stagnation_steps >= 3:
+                self.goal_request[0] = -1
+            elif avg_progress > 0.5:
+                self.goal_request[0] = 1
+            else:
+                self.goal_request[0] = 0
+    
+    def get_goal_progress(self):
+        """
+        Fortschritt der Lernziele: 0.0 = kein Fortschritt, 1.0 = Unsicherheit komplett abgebaut.
+        
+        Returns:
+            progress: list[float] — Fortschritt pro Ziel-Token
+        """
+        with torch.no_grad():
+            progress = []
+            for i in range(self.goals.size(0)):
+                start = self.goal_uncertainty_start[i]
+                now = self.goal_uncertainty_now[i]
+                if start <= 1e-6:
+                    progress.append(0.0)
+                else:
+                    progress.append(max(0.0, min(1.0, 1.0 - now / start)))
+            return progress
+
+    
+    # =========================================================================
     #  3. KONDITIONIERUNG
     # =========================================================================
     
@@ -6693,6 +6782,10 @@ class ActiveLearning(CogModule):
             'knowledge_gaps': [t for t, _ in self.get_knowledge_gaps(5)],
             'domain_uncertainty': [float(x) for x in self.domain_uncertainty.cpu().tolist()],
             'domain_counts': [int(x) for x in self.domain_counts.cpu().tolist()],
+            # PHASE 59: Selbst-evaluative Zielsetzung
+            'goals': [int(x) for x in self.goals.cpu().tolist()],
+            'goal_progress': self.get_goal_progress(),
+            'stagnation_steps': self._stagnation_steps,
         }
 
 
@@ -7343,6 +7436,10 @@ class CogLang:
                 if self._meta_learning is not None:
                     unc_signal = float(self._active_learning.uncertainty_ema[0].item())
                     self._meta_learning.adapt_from_uncertainty(unc_signal)
+                
+                # PHASE 59: Selbst-evaluative Zielsetzung — eigene Lernziele
+                # aus Wissenslücken setzen und Fortschritt tracken
+                self._active_learning.update_goals()
             
             # PHASE 48: MetaKognition learn_step — Kalibrierung + Strategie-Lernen
             if self._metakognition is not None:

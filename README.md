@@ -8,24 +8,24 @@
 
 ## Architecture Overview
 
-**33 CogModule classes · 4440 lines · 43 phases**
+**34 CogModule classes · 7635 lines (coglang.py) · 57 phases**
 
 CogLang v3 is a complete AGI architecture with zero backpropagation. All learning happens via Hebbian rules, predictive coding errors, and local plasticity. The system autonomously evolves through multi-domain BPE data.
 
 | Metric | Value |
 |--------|-------|
-| Modules | 33 CogModule classes |
-| Parameters | ~324M |
-| VRAM | ~1939MB (45% of 8GB RTX 2070 SUPER) |
-| Speed | 1.8 step/s (throttled, 2 threads) |
+| Modules | 34 CogModule classes |
+| Parameters | ~385.5M |
+| VRAM | ~1997MB (25% of 8GB RTX 2070 SUPER) |
+| Speed | 2.6 step/s (throttled, 2 threads) |
 | Precision | FP16/FP32 Mixed |
-| Training | Step 2722+/50000, ~7h ETA |
-| Loss | ~54 (warmup phase, LR climbing) |
+| Training | Step ~600+/50000, ~5.5h ETA |
+| Loss | ~57 (foundation phase, warmup LR) |
 | Best Loss | 2.78 (from checkpoint) |
 
 ---
 
-## All 43 Phases
+## All 57 Phases
 
 ### Core Architecture (1-15)
 | # | Phase | Class | Description |
@@ -90,6 +90,20 @@ CogLang v3 is a complete AGI architecture with zero backpropagation. All learnin
 | 42 | Consciousness Glimpse | `ConsciousnessGlimpse` | Global Workspace: salience spotlight, broadcast, recurrent coherence |
 | 43 | Auto-Curriculum | `AutoCurriculum` | ZPD-based difficulty adaptation, 5 levels, mastery tracking |
 
+### Deep Cognition & Meta-Cognition (44-57)
+| # | Phase | Class | Description |
+|---|-------|-------|-------------|
+| 44 | Causal Reasoning | `CausalReasoning` | Causal structure discovery, intervention inference, world-model cause-effect |
+| 45 | System-2 Reasoning | `System2Reasoning` | Chain-of-thought, tree-of-thought, verification, slow deliberate reasoning |
+| 46 | Imagination & Planning | `ImaginationPlanning` | Future simulation, plan generation, imagination vs. reality learning |
+| 47 | Exploration Drive | `ExplorationDrive` | Active knowledge-gap search, novelty bonus, curiosity-driven data selection |
+| 48 | MetaKognition | `MetaKognition` | Thinking about thinking: strategy selection, confidence calibration, resource allocation |
+| 49 | Hierarchical Memory | `HierarchicalMemory` | 5-level memory hierarchy (sensory/working/episodic/semantic/procedural) with consolidation |
+| 52 | Hierarchical Goal | `HierarchicalGoal` | Goal decomposer, subgoal tracker, goal adaptation to environment |
+| 55 | Meta-Learning | `MetaLearning` | Learning to learn: strategy encoder, meta-predictor, hyperparameter controller |
+| 56 | Active Learning | `ActiveLearning` | Self-directed learning: uncertainty sampler, query mechanism, curriculum on demand |
+| 57 | Uncertainty-Coupled Meta-Learning | *(MetaLearning upgrade)* | ActiveLearning uncertainty modulates hyperparameters (conservative LR, more exploration); meta-HPs now applied to real optimizer LR |
+
 ---
 
 ## Quick Start
@@ -120,8 +134,8 @@ python3 chat.py
 
 ```
 anima/
-├── coglang.py                  # 4440 lines — all 33 CogModule classes + CogLang controller
-├── coglang_evolve.py           # 1058 lines — autonomous evolution loop (domain sampling, sleep, reflection)
+├── coglang.py                  # 7635 lines — all 34 CogModule classes + CogLang controller
+├── coglang_evolve.py           # 1183 lines — autonomous evolution loop (domain sampling, sleep, reflection, stats)
 ├── coglang_train.py            # Single training run
 ├── training_controller.py      # Pause/resume/stop controller
 ├── code_scraper.py             # GitHub + StackOverflow scraper
@@ -187,6 +201,12 @@ TransferLearning (domain adapter)           │
 AutoCurriculum (difficulty embedding)       │
     │                                       │
     ▼                                       │
+MetaLearning (strategy + HP control)        │
+    │                                       │
+    ▼                                       │
+ActiveLearning (uncertainty modulation)     │
+    │                                       │
+    ▼                                       │
 OutputDecoder (d_sparse → vocab) ──────────► Logits
     │                                       │
     ▼                                       │
@@ -213,9 +233,10 @@ EvolutionStrategy (population update)       │
 - **No autograd:** `with torch.no_grad()` everywhere — pure Hebbian
 - **Modular:** Each phase is a CogModule subclass, composable via factory methods
 - **Autonomous:** `coglang_evolve.py` runs indefinitely with domain curriculum, sleep phases, self-reflection
-- **Throttled:** 45% VRAM fraction, 2 CPU threads, sleeps between steps — PC remains usable
+- **Throttled:** 25% VRAM fraction, 2 CPU threads, sleeps between steps — PC remains usable
 - **Resilient:** NaN guards, checkpoint fallback, strict=False loading, weight clamping
-- **Composable:** All 33 modules share the same `d_model`/`d_sparse` interface
+- **Self-directed:** ActiveLearning decides which data to sample; MetaLearning tunes its own hyperparameters from uncertainty (Phase 57)
+- **Composable:** All 34 modules share the same `d_model`/`d_sparse` interface
 
 ---
 
@@ -255,51 +276,59 @@ ls -la /home/anima/checkpoints/
 
 ## Module Reference
 
-All 33 CogModule subclasses (in order of appearance):
+All 34 CogModule subclasses (in order of appearance in `coglang.py`):
 
 | # | Class | Line | Description |
 |---|-------|------|-------------|
-| 1 | `CodeTokenizer` | 14 | BPE tokenizer, 4096 vocab |
-| 2 | `BPETokenizer` | 104 | Byte-pair encoding |
-| 3 | `SensoryInput` | 203 | Embedding + BPE lookup |
-| 4 | `SparseEncoder` | 254 | d_model → d_sparse projection |
-| 5 | `PredictiveLayer` | 283 | Single PC layer: predict, encode, error |
-| 6 | `PredictiveStack` | 454 | 6-layer PC stack |
-| 7 | `HebbianAttention` | 576 | Hebbian self-attention |
-| 8 | `PredictiveAttention` | 688 | Error-driven attention |
-| 9 | `SelfModel` | 748 | Meta-cognitive confidence |
-| 10 | `EpisodicMemory` | 808 | Working memory |
-| 11 | `OutputDecoder` | 907 | d_sparse → vocab |
-| 12 | `ActiveInference` | 1191 | Kalman filter + epistemic value |
-| 13 | `SleepReplay` | 1399 | Priority replay + consolidation |
-| 14 | `HierarchicalPC` | 1599 | 3-level PC hierarchy |
-| 15 | `NeuroSymbolicBridge` | 1760 | Rule-based modulation |
-| 16 | `EvolutionStrategyOptimizer` | 1874 | Population-based optimization |
-| 17 | `SkillModule` | 1955 | Specialized sub-networks |
-| 18 | `GoalEncoder` | 2010 | Goal-directed generation |
-| 19 | `SelfReflection` | 2089 | Meta-cognitive self-critique |
-| 20 | `SecurityHead` | 2192 | CWE anomaly detection |
-| 21 | `NetworkEncoder` | 2267 | Protocol encoding |
-| 22 | `KnowledgeGraph` | 2356 | Entity-relation graph |
-| 23 | `ToolUse` | 2500 | External tool calling |
-| 24 | `MultiAgent` | 2692 | Dual-persona debate |
-| 25 | `TransferLearning` | 3020 | Domain adapters + few-shot |
-| 26 | `ConsciousnessGlimpse` | 3309 | Global workspace broadcasting |
-| 27 | `AutoCurriculum` | 3539 | ZPD difficulty adaptation |
-| 28–33 | *(internal CogLang structures)* | | Stack, memory, targets, etc. |
+| 1 | `EpisodicMemory` | 361 | Working memory across sequences |
+| 2 | `SensoryInput` | 458 | BPE embedding lookup |
+| 3 | `SparseEncoder` | 477 | d_model → d_sparse projection |
+| 4 | `HebbianAttention` | 501 | Hebbian self-attention |
+| 5 | `PredictiveAttention` | 557 | Error-driven attention |
+| 6 | `PredictiveLayer` | 625 | Single PC layer: predict, encode, error |
+| 7 | `SelfModel` | 753 | Meta-cognitive confidence |
+| 8 | `PredictiveStack` | 835 | Multi-layer PC stack |
+| 9 | `HierarchicalPC` | 899 | 3-level PC hierarchy |
+| 10 | `OutputDecoder` | 1162 | d_sparse → vocab |
+| 11 | `ActiveInference` | 1192 | Kalman filter + epistemic value |
+| 12 | `SleepReplay` | 1400 | Priority replay + consolidation |
+| 13 | `NeuroSymbolicBridge` | 1598 | Rule-based modulation |
+| 14 | `EvolutionStrategyOptimizer` | 1655 | Population-based optimization |
+| 15 | `SkillModule` | 1828 | Specialized sub-networks |
+| 16 | `SecurityHead` | 1886 | CWE anomaly detection |
+| 17 | `NetworkEncoder` | 1952 | Protocol encoding |
+| 18 | `GoalEncoder` | 2012 | Goal-directed generation |
+| 19 | `SelfReflection` | 2091 | Meta-cognitive self-critique |
+| 20 | `KnowledgeGraph` | 2275 | Entity-relation graph |
+| 21 | `ToolUse` | 2547 | External tool calling |
+| 22 | `MultiAgent` | 2820 | Dual-persona debate |
+| 23 | `TransferLearning` | 3021 | Domain adapters + few-shot |
+| 24 | `ConsciousnessGlimpse` | 3310 | Global workspace broadcasting |
+| 25 | `AutoCurriculum` | 3542 | ZPD difficulty adaptation |
+| 26 | `CausalReasoning` | 3773 | Causal structure discovery |
+| 27 | `System2Reasoning` | 4005 | Chain/tree-of-thought reasoning |
+| 28 | `ImaginationPlanning` | 4250 | Future simulation + planning |
+| 29 | `ExplorationDrive` | 4507 | Knowledge-gap search |
+| 30 | `MetaKognition` | 4767 | Thinking about thinking |
+| 31 | `HierarchicalMemory` | 5090 | 5-level memory hierarchy |
+| 32 | `HierarchicalGoal` | 5604 | Goal decomposition |
+| 33 | `MetaLearning` | 6003 | Learning to learn |
+| 34 | `ActiveLearning` | 6437 | Self-directed active learning |
 
 ---
 
 ## Training Status
 
-The model is currently training autonomously:
-- **Step:** ~2722/50000 (warmup phase)
-- **Loss:** ~54 (expected increase during LR warmup)
-- **VRAM:** 1939MB (stable)
-- **LR:** 0.116 (climbing to 0.5 at step 5000)
-- **Speed:** 1.8 step/s
+The model is currently training autonomously (fresh run, Phases 55-57 active):
+- **Step:** ~600+/50000 (foundation phase)
+- **Loss:** ~57 (expected variance during LR warmup)
+- **VRAM:** ~1997MB (25% of 8GB, stable)
+- **LR:** ~0.12 (climbing to 0.5 at step 5000)
+- **Speed:** 2.6 step/s
 - **Domain:** foundation (text only)
-- **Phase Progress:** 4.8%
+- **Meta-Learning:** active — HP control coupled to ActiveLearning uncertainty (Phase 57)
+- **ActiveLearning:** active — 1 query/step, knowledge-gap tracking, domain preference weights
+- **train_state.json:** full module stats (meta_learning, active_learning, causal, reasoning, …)
 
 After warmup (step 5000), the loss should drop as cosine annealing kicks in.
 

@@ -6000,6 +6000,386 @@ class HierarchicalGoal(CogModule):
         }
 
 
+class MetaLearning(CogModule):
+    """
+    PHASE 55: Meta-Learning — Lernen zu Lernen.
+    
+    CogLang optimiert seinen eigenen Lernprozess:
+    
+    1. LearningStrategyEncoder — Kodiert aktuelle Hyperparameter als Strategie-Vektor
+    2. StrategyMetaNetwork — Sagt voraus: welche Strategie für welche Daten?
+    3. HyperparameterController — Steuert LR, Sparsity, Batch-Size dynamisch
+    
+    Inspiriert von:
+    - Learning to Learn by Gradient Descent by Gradient Descent (Andrychowicz 2016)
+    - Meta-Learning in Reinforcement Learning (Duan 2017)
+    - Hyperparameter-Optimization as Meta-Learning
+    """
+    def __init__(self, d_model, n_hyperparams=5, n_strategy_dim=32, window_size=200):
+        super().__init__()
+        self.d_model = d_model
+        self.n_hyperparams = n_hyperparams
+        self.n_strategy_dim = n_strategy_dim
+        self.window_size = window_size
+        
+        # =====================================================================
+        #  1. LEARNING STRATEGY ENCODER
+        # =====================================================================
+        # Kodiert aktuelle Hyperparameter (LR, Sparsity, Momentum, Temperature, Batch-Size)
+        # als d_model-Vektor für das Meta-Netzwerk
+        self.hp_embedding = nn.Embedding(100, d_model // 4)  # Diskrete HP-Stufen
+        self.strategy_encoder = nn.Sequential(
+            nn.Linear(n_hyperparams * (d_model // 4) + d_model, d_model),
+            nn.Tanh(),
+            nn.Linear(d_model, n_strategy_dim),
+        )
+        
+        # =====================================================================
+        #  2. STRATEGY META-NETWORK
+        # =====================================================================
+        # Sagt voraus, wie gut eine Strategie für gegebene Daten funktioniert
+        self.meta_predictor = nn.Sequential(
+            nn.Linear(n_strategy_dim + d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, 3),  # loss_pred, progress_pred, plateau_risk
+        )
+        
+        # ——— Strategy Memory (Buffer) ———
+        self.register_buffer('strategy_history', torch.zeros(window_size, n_strategy_dim))
+        self.register_buffer('strategy_performance', torch.zeros(window_size, 3))  # loss, progress, plateau
+        self.register_buffer('strategy_data_embedding', torch.zeros(window_size, d_model))
+        self._strategy_idx = 0
+        
+        # =====================================================================
+        #  3. HYPERPARAMETER CONTROLLER
+        # =====================================================================
+        # Steuert 5 Hyperparameter:
+        #   [0] LR-Scale (0.1..3.0x aktuelles LR)
+        #   [1] Sparsity (20%..80%)
+        #   [2] Momentum (0.5..0.99)
+        #   [3] Temperature (0.1..2.0)
+        #   [4] Batch-Size-Multiplier (0.5..2.0x)
+        self.hp_controller = nn.Sequential(
+            nn.Linear(n_strategy_dim + 3, d_model // 2),  # strategy + loss_trend + plateau + variance
+            nn.ReLU(),
+            nn.Linear(d_model // 2, d_model // 4),
+            nn.ReLU(),
+            nn.Linear(d_model // 4, n_hyperparams),
+        )
+        
+        # ——— Loss-Trend-Detection ———
+        self.register_buffer('loss_history', torch.zeros(window_size))
+        self.register_buffer('loss_trend', torch.zeros(1))  # -1=fallend, 0=stabil, 1=steigend
+        self.register_buffer('plateau_counter', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('loss_variance', torch.zeros(1))
+        self._loss_idx = 0
+        
+        # ——— Hyperparameter-Zustand ———
+        self.register_buffer('current_hp', torch.ones(n_hyperparams))
+        # 0: LR-Scale=1.0, 1: Sparsity=0.5, 2: Momentum=0.9, 
+        # 3: Temperature=1.0, 4: Batch-Mult=1.0
+        self.register_buffer('hp_names', torch.tensor([0, 1, 2, 3, 4]))  # dummy für Metriken
+        
+        # ——— Metrik ———
+        self.register_buffer('hp_adaptation_count', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('meta_improvement', torch.zeros(100))  # Letzte 100 Verbesserungen
+        self._meta_idx = 0
+        
+        self._max_weight = 2.0
+    
+    # =========================================================================
+    #  1. STRATEGY ENCODING
+    # =========================================================================
+    
+    def encode_strategy(self, hidden_states, hyperparams=None):
+        """
+        Kodiere aktuelle Lernstrategie als Vektor.
+        
+        Args:
+            hidden_states: [batch, seq, d_model] — Aktuelle Aktivierungen
+            hyperparams: list oder None — [lr_scale, sparsity, momentum, temp, batch_mult]
+            
+        Returns:
+            strategy_vec: [n_strategy_dim] — Strategie-Vektor
+        """
+        with torch.no_grad():
+            if hyperparams is None:
+                hyperparams = self.current_hp.tolist()
+            
+            # Embedding der Hyperparameter
+            hp_indices = torch.tensor([
+                min(int(h * 100), 99) for h in hyperparams[:self.n_hyperparams]
+            ], device=hidden_states.device)
+            hp_emb = self.hp_embedding(hp_indices)  # [n_hp, d_model//4]
+            hp_flat = hp_emb.view(-1)  # [n_hp * d_model//4]
+            
+            # Data-Embedding
+            data_emb = hidden_states.mean(dim=(0, 1))  # [d_model]
+            
+            # Kombinieren
+            combined = torch.cat([hp_flat, data_emb], dim=-1)  # [n_hp*d_model//4 + d_model]
+            
+            strategy_vec = self.strategy_encoder(combined.unsqueeze(0)).squeeze(0)  # [n_strategy_dim]
+            
+            return strategy_vec
+    
+    # =========================================================================
+    #  2. STRATEGY META-NETWORK
+    # =========================================================================
+    
+    def predict_strategy_performance(self, strategy_vec, data_embedding):
+        """
+        Sage voraus, wie gut diese Strategie für gegebene Daten funktioniert.
+        
+        Args:
+            strategy_vec: [n_strategy_dim]
+            data_embedding: [d_model]
+            
+        Returns:
+            prediction: dict mit loss_pred, progress_pred, plateau_risk
+        """
+        with torch.no_grad():
+            combined = torch.cat([strategy_vec, data_embedding], dim=-1).unsqueeze(0)
+            raw = self.meta_predictor(combined).squeeze(0)  # [3]
+            
+            # Post-Processing
+            loss_pred = torch.sigmoid(raw[0]).item() * 20.0  # 0..20 Loss
+            progress_pred = torch.sigmoid(raw[1]).item()  # 0..1 Progress
+            plateau_risk = torch.sigmoid(raw[2]).item()  # 0..1 Plateau-Risiko
+            
+            return {
+                'predicted_loss': loss_pred,
+                'predicted_progress': progress_pred,
+                'predicted_plateau_risk': plateau_risk,
+            }
+    
+    def store_strategy_result(self, strategy_vec, data_embedding, loss_val, progress_val, plateau_val):
+        """Speichere Strategie-Ergebnis für späteres Lernen."""
+        idx = self._strategy_idx % self.window_size
+        self.strategy_history[idx] = strategy_vec
+        self.strategy_data_embedding[idx] = data_embedding
+        self.strategy_performance[idx] = torch.tensor([loss_val, progress_val, plateau_val])
+        self._strategy_idx += 1
+    
+    def learn_from_strategy_history(self, n_samples=32):
+        """
+        Lerne aus gespeicherten Strategie-Ergebnissen.
+        Verbessert die Vorhersage, welche Strategie gut funktioniert.
+        
+        Returns:
+            learning_signal: float — Wie viel wurde gelernt?
+        """
+        with torch.no_grad():
+            n_valid = min(self._strategy_idx, self.window_size)
+            if n_valid < n_samples:
+                return 0.0
+            
+            # Sample zufällige Batches
+            indices = torch.randint(0, n_valid, (n_samples,), device=self.strategy_history.device)
+            
+            strategies = self.strategy_history[indices]  # [n, n_strategy_dim]
+            data_embs = self.strategy_data_embedding[indices]  # [n, d_model]
+            targets = self.strategy_performance[indices]  # [n, 3]
+            
+            total_error = 0.0
+            for i in range(n_samples):
+                combined = torch.cat([strategies[i], data_embs[i]], dim=-1).unsqueeze(0)
+                prediction = self.meta_predictor(combined).squeeze(0)
+                
+                # Hebbian-ähnliches Update
+                error = targets[i] - prediction
+                # Vereinfachtes Meta-Update: ziehe prediction Richtung target
+                lr = self._lr * self._meta_lr_scale * 0.01
+                # NUR der erste Layer hat combined als Eingang ([d, n_strategy_dim + d_model]).
+                # Die inneren Layer haben andere Eingangsdimensionen — ein dw aus combined
+                # würde dort zu Shape-Kollisionen führen (z.B. d_sparse vs. d_sparse + 32).
+                first = self.meta_predictor[0]
+                dw = error.unsqueeze(1) * combined  # [3, d_in]
+                grad = dw.mean(dim=0, keepdim=True) * lr  # [1, d_in] → broadcastet auf [d_out, d_in]
+                first.weight.data.add_(grad)
+                first.bias.data.add_(error.mean(dim=0) * lr)  # [3] → [d_out]
+                first.weight.data.clamp_(-self._max_weight, self._max_weight)
+                first.bias.data.clamp_(-self._max_weight, self._max_weight)
+                
+                total_error += error.abs().mean().item()
+            
+            avg_error = total_error / n_samples
+            return avg_error
+    
+    # =========================================================================
+    #  3. HYPERPARAMETER CONTROL
+    # =========================================================================
+    
+    def update_loss_trend(self, current_loss):
+        """
+        Aktualisiere Loss-Trend-Detection.
+        
+        Args:
+            current_loss: float — Aktueller Loss-Wert
+        """
+        idx = self._loss_idx % self.window_size
+        self.loss_history[idx] = current_loss
+        self._loss_idx += 1
+        
+        if self._loss_idx >= 10:
+            # Berechne Trend über letzte 10 Werte
+            recent = self.loss_history[max(0, idx - 9):idx + 1]
+            if len(recent) >= 5:
+                # Linearer Trend: Steigung der Regressionsgerade
+                x = torch.arange(len(recent), device=recent.device).float()
+                x_mean = x.mean()
+                y_mean = recent.mean()
+                slope = ((x - x_mean) * (recent - y_mean)).sum() / ((x - x_mean) ** 2).sum()
+                
+                # Trend: -1 = fallend (gut), 0 = stabil, 1 = steigend (schlecht)
+                if slope < -0.1:
+                    self.loss_trend[0] = -1.0
+                    self.plateau_counter[0] = 0
+                elif slope > 0.1:
+                    self.loss_trend[0] = 1.0
+                    self.plateau_counter[0] = 0
+                else:
+                    self.loss_trend[0] = 0.0
+                    self.plateau_counter[0] += 1
+                
+                # Varianz
+                self.loss_variance[0] = recent.var().item()
+    
+    def get_hyperparams(self):
+        """
+        Gib aktuelle optimierte Hyperparameter zurück.
+        
+        Returns:
+            dict mit lr_scale, sparsity, momentum, temperature, batch_mult
+        """
+        with torch.no_grad():
+            hp = self.current_hp.tolist()
+            return {
+                'lr_scale': max(0.1, min(3.0, hp[0])),
+                'sparsity': max(0.2, min(0.8, hp[1])),
+                'momentum': max(0.5, min(0.99, hp[2])),
+                'temperature': max(0.1, min(2.0, hp[3])),
+                'batch_mult': max(0.5, min(2.0, hp[4])),
+            }
+    
+    def adapt_hyperparams(self, hidden_states):
+        """
+        Passe Hyperparameter basierend auf Strategie + Loss-Trend an.
+        
+        Args:
+            hidden_states: [batch, seq, d_model] — Aktuelle Aktivierungen
+            
+        Returns:
+            adapted_hp: dict mit neuen Hyperparametern
+        """
+        with torch.no_grad():
+            # Strategie-Vektor
+            strategy_vec = self.encode_strategy(hidden_states)
+            
+            # Features für Controller: strategy + trend + plateau + variance
+            trend = self.loss_trend.item()
+            plateau = min(self.plateau_counter.item(), 50) / 50.0  # Normalisiert
+            variance = min(self.loss_variance.item(), 10.0) / 10.0
+            
+            features = torch.cat([
+                strategy_vec,
+                torch.tensor([trend, plateau, variance], device=hidden_states.device)
+            ], dim=-1).unsqueeze(0)  # [1, n_strategy_dim + 3]
+            
+            # Generiere neue HP-Werte
+            raw_hp = self.hp_controller(features).squeeze(0)  # [n_hyperparams]
+            
+            # Skaliere auf sinnvolle Bereiche
+            hp_scaled = torch.zeros_like(raw_hp)
+            hp_scaled[0] = 0.1 + 2.9 * torch.sigmoid(raw_hp[0])  # LR-Scale: 0.1..3.0
+            hp_scaled[1] = 0.2 + 0.6 * torch.sigmoid(raw_hp[1])  # Sparsity: 0.2..0.8
+            hp_scaled[2] = 0.5 + 0.49 * torch.sigmoid(raw_hp[2])  # Momentum: 0.5..0.99
+            hp_scaled[3] = 0.1 + 1.9 * torch.sigmoid(raw_hp[3])  # Temp: 0.1..2.0
+            hp_scaled[4] = 0.5 + 1.5 * torch.sigmoid(raw_hp[4])  # Batch-Mult: 0.5..2.0
+            
+            # Plateau-Boost: Bei Plateau mehr Exploration (höhere Temp, niedrigere Sparsity)
+            if self.plateau_counter > 10:
+                hp_scaled[3] = min(2.0, hp_scaled[3] * 1.2)  # Höhere Temperatur
+                hp_scaled[1] = max(0.2, hp_scaled[1] * 0.8)  # Niedrigere Sparsity
+            
+            # Sanfte Aktualisierung (EMA)
+            self.current_hp = 0.7 * self.current_hp + 0.3 * hp_scaled
+            self.hp_adaptation_count += 1
+            
+            return self.get_hyperparams()
+    
+    # =========================================================================
+    #  FORWARD & LEARN
+    # =========================================================================
+    
+    def forward(self, hidden_states, current_loss=None):
+        """
+        Meta-Learning Forward-Pass.
+        
+        Args:
+            hidden_states: [batch, seq, d_model]
+            current_loss: float oder None
+            
+        Returns:
+            dict mit meta_advice (empfohlene Hyperparameter + Strategie)
+        """
+        with torch.no_grad():
+            # Loss-Trend aktualisieren
+            if current_loss is not None:
+                self.update_loss_trend(current_loss)
+            
+            # Strategie kodieren
+            strategy_vec = self.encode_strategy(hidden_states)
+            data_emb = hidden_states.mean(dim=(0, 1))
+            
+            # Performance vorhersagen
+            prediction = self.predict_strategy_performance(strategy_vec, data_emb)
+            
+            # Hyperparameter anpassen (nur alle 50 Steps)
+            if self.hp_adaptation_count % 50 == 0:
+                hp = self.adapt_hyperparams(hidden_states)
+            else:
+                hp = self.get_hyperparams()
+            
+            # Plateau-Warnung
+            plateau_warning = self.plateau_counter.item() > 20
+            
+            return {
+                'hyperparams': hp,
+                'prediction': prediction,
+                'trend': self.loss_trend.item(),
+                'plateau_steps': self.plateau_counter.item(),
+                'plateau_warning': plateau_warning,
+                'hp_adaptations': self.hp_adaptation_count.item(),
+            }
+    
+    def get_meta_stats(self):
+        """Gib Meta-Learning-Statistiken."""
+        hp = self.get_hyperparams()
+        n_valid = min(self._strategy_idx, self.window_size)
+        
+        avg_meta_error = 0.0
+        if n_valid > 0:
+            recent_errors = self.meta_improvement[:min(self._meta_idx, 100)]
+            if recent_errors.numel() > 0:
+                avg_meta_error = recent_errors.mean().item()
+        
+        return {
+            'lr_scale': hp['lr_scale'],
+            'sparsity': hp['sparsity'],
+            'momentum': hp['momentum'],
+            'temperature': hp['temperature'],
+            'batch_mult': hp['batch_mult'],
+            'trend': self.loss_trend.item(),
+            'plateau_steps': self.plateau_counter.item(),
+            'n_strategies_tried': n_valid,
+            'avg_meta_error': avg_meta_error,
+            'hp_adaptations': self.hp_adaptation_count.item(),
+        }
+
+
 class CogLang:
     def __init__(self, use_mixed_precision=True):
         self.modules = nn.ModuleList()
@@ -6031,6 +6411,7 @@ class CogLang:
         self._metakognition = None
         self._hierarchical_memory = None
         self._hierarchical_goal = None
+        self._meta_learning = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -6144,6 +6525,13 @@ class CogLang:
         m = HierarchicalGoal(d_model, max_goals, max_subgoals_per_goal, max_depth)
         self.modules.append(m)
         self._hierarchical_goal = m
+        return m
+
+    def MetaLearning(self, d_model, n_hyperparams=5, n_strategy_dim=32, window_size=200):
+        """PHASE 55: Meta-Learning — Hyperparameter-Steuerung, Strategie-Selektion, Meta-Netzwerk."""
+        m = MetaLearning(d_model, n_hyperparams, n_strategy_dim, window_size)
+        self.modules.append(m)
+        self._meta_learning = m
         return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
@@ -6449,6 +6837,14 @@ class CogLang:
                 # Im Lernmodus: aktualisiere Goal-Fortschritt
                 self._hierarchical_goal.update_progress(pred, loss_val=getattr(self, '_current_loss', None))
         
+        # PHASE 55: Meta-Learning — Hyperparameter-Steuerung
+        if self._meta_learning is not None and not learn:
+            meta_advice = self._meta_learning(pred, current_loss=getattr(self, '_current_loss', None))
+            info_extra['meta_learning'] = meta_advice
+        elif self._meta_learning is not None and learn:
+            # Im Lernmodus nur loss tracken
+            self._meta_learning.update_loss_trend(getattr(self, '_current_loss', 10.0))
+        
         # PHASE 39: Tool Use — Erkenne und führe Tool-Aufrufe aus
         if self._tool_use is not None and not learn:
             # Dekodiere Output in Text (grobe Approximation)
@@ -6566,6 +6962,24 @@ class CogLang:
                 if reflection:
                     self._self_reflection.learn_step(reflection, loss.item())
                     
+            # PHASE 55: Meta-Learning learn_step — Strategie speichern + lernen
+            if self._meta_learning is not None and info.get('pred') is not None:
+                strategy_vec = self._meta_learning.encode_strategy(info['pred'])
+                data_emb = info['pred'].mean(dim=(0, 1))
+                plateau_val = 1.0 if getattr(self._meta_learning, 'plateau_counter', torch.zeros(1))[0] > 20 else 0.0
+                self._meta_learning.store_strategy_result(
+                    strategy_vec, data_emb,
+                    min(loss.item(), 20.0),
+                    max(0.0, 1.0 - min(loss.item(), 10.0) / 10.0),
+                    plateau_val,
+                )
+                # Lerne aus History (alle 100 Steps)
+                if not hasattr(self, '_meta_learn_counter'):
+                    self._meta_learn_counter = 0
+                self._meta_learn_counter += 1
+                if self._meta_learn_counter % 100 == 0:
+                    self._meta_learning.learn_from_strategy_history()
+            
             # PHASE 48: MetaKognition learn_step — Kalibrierung + Strategie-Lernen
             if self._metakognition is not None:
                 reflection = info.get('reflection', {})
@@ -6892,6 +7306,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.MetaKognition(d_model=d_sparse, n_strategies=4, n_resource_levels=3)
     brain.HierarchicalMemory(d_model=d_sparse, sensory_buffer_size=1000, working_mem_size=256, episodic_buffer_size=500)
     brain.HierarchicalGoal(d_model=d_sparse, max_goals=32, max_subgoals_per_goal=8, max_depth=4)
+    brain.MetaLearning(d_model=d_sparse, n_hyperparams=5, n_strategy_dim=32, window_size=200)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

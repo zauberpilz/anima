@@ -872,6 +872,8 @@ def run_evolution():
                             'hierarchical_memory': brain._hierarchical_memory.get_memory_stats() if hasattr(brain, '_hierarchical_memory') and brain._hierarchical_memory is not None else {},
                             # PHASE 52: Hierarchical Goal Stats
                             'hierarchical_goal': brain._hierarchical_goal.get_goal_stats() if hasattr(brain, '_hierarchical_goal') and brain._hierarchical_goal is not None else {},
+                            # PHASE 55: Meta-Learning Stats
+                            'meta_learning': brain._meta_learning.get_meta_stats() if hasattr(brain, '_meta_learning') and brain._meta_learning is not None else {},
                         }
                         with open('/home/anima/train_state.json', 'w') as sf:
                             json.dump(state, sf)

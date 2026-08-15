@@ -6087,6 +6087,10 @@ class MetaLearning(CogModule):
         self.register_buffer('meta_improvement', torch.zeros(100))  # Letzte 100 Verbesserungen
         self._meta_idx = 0
         
+        # PHASE 57: Unsicherheits-gekoppelte HP-Steuerung (Active-Learning × Meta-Learning)
+        self.register_buffer('uncertainty_coupled', torch.zeros(1))
+        self._unc_step = 0
+        
         self._max_weight = 2.0
     
     # =========================================================================
@@ -6311,6 +6315,54 @@ class MetaLearning(CogModule):
             return self.get_hyperparams()
     
     # =========================================================================
+    #  3b. PHASE 57: UNGEWISSHEITS-GEKOPPELTE HP-STEUERUNG
+    # =========================================================================
+    
+    def adapt_from_uncertainty(self, uncertainty):
+        """
+        PHASE 57: Kopplung Active-Learning × Meta-Learning.
+        
+        Die Unsicherheit aus dem ActiveLearning-Modul moduliert die
+        Hyperparameter sanft:
+          - Hohe Unsicherheit  → konservativer LR, mehr Exploration
+            (Temperatur hoch, Sparsity runter → mehr Parameter lernen)
+          - Niedrige Unsicherheit → tendenziell aggressiver LR
+        
+        Bewusst OHNE Shape-Änderung am hp_controller (Checkpoint-sicher):
+        Die Modulation wirkt als sanftes Curiousity-Gate auf current_hp.
+        Nur alle 10 Steps aktiv, damit die HP stabil bleiben.
+        """
+        with torch.no_grad():
+            self._unc_step += 1
+            if self._unc_step % 10 != 0:
+                return self.get_hyperparams()
+            
+            unc = min(max(float(uncertainty), 0.0), 1.0)
+            self.uncertainty_coupled[0] = unc
+            
+            hp = self.current_hp.clone()
+            # LR-Scale: Unsicherheit → konservativer (weniger Risiko)
+            hp[0] = hp[0] * (1.0 - 0.25 * unc)
+            # Sparsity: Unsicherheit → weniger Sparsity (mehr Parameter lernen)
+            hp[1] = hp[1] * (1.0 - 0.15 * unc)
+            # Temperatur: Unsicherheit → mehr Exploration
+            hp[3] = hp[3] * (1.0 + 0.20 * unc)
+            # Momentum: Unsicherheit → stabiler
+            hp[2] = hp[2] * (1.0 + 0.05 * unc)
+            
+            # Clamp auf gültige Bereiche
+            hp[0] = max(0.1, min(3.0, hp[0]))
+            hp[1] = max(0.2, min(0.8, hp[1]))
+            hp[2] = max(0.5, min(0.99, hp[2]))
+            hp[3] = max(0.1, min(2.0, hp[3]))
+            hp[4] = max(0.5, min(2.0, hp[4]))
+            
+            # Sanfte EMA-Übernahme (bewusst konservativer als adapt_hyperparams)
+            self.current_hp = 0.9 * self.current_hp + 0.1 * hp
+            
+            return self.get_hyperparams()
+    
+    # =========================================================================
     #  FORWARD & LEARN
     # =========================================================================
     
@@ -6377,6 +6429,231 @@ class MetaLearning(CogModule):
             'n_strategies_tried': n_valid,
             'avg_meta_error': avg_meta_error,
             'hp_adaptations': self.hp_adaptation_count.item(),
+            # PHASE 57: Unsicherheits-Kopplung
+            'uncertainty_coupled': self.uncertainty_coupled.item(),
+        }
+
+
+class ActiveLearning(CogModule):
+    """
+    PHASE 56: Aktives Lernen — Das Modell entscheidet selbst, was es als nächstes lernt.
+    
+    Drei Komponenten:
+    
+    1. UncertaintySampler — wählt Daten mit höchster Unsicherheit:
+       - Berechnet pro Batch eine Unsicherheit aus Prediction-Error + Confidenz
+       - EMA-Unsicherheit pro Domäne (welche Domäne braucht mehr Daten?)
+       - Token-Unsicherheits-Map über den Vokabular-Raum (Wissenslücken)
+    
+    2. QueryMechanism — generiert gezielte Lernanfragen:
+       - Identifiziert die unsichersten Tokens als Wissenslücken
+       - Empfiehlt Domänen-Gewichte proportional zur Unsicherheit
+       - Zählt ausgeführte Queries (aktives Sampling)
+    
+    3. CurriculumOnDemand — fordert schwierigere/leichtere Daten an:
+       - Verfolgt den Unsicherheits-Trend (EMA)
+       - Steigende Unsicherheit → leichtere Daten (-1)
+       - Fallende Unsicherheit → schwerere Daten (+1)
+    
+    Integration: Nutzt ActiveInference (Curiosity) + AutoCurriculum (ZPD).
+    Erfolgskriterium: Niedrigerer Loss mit weniger Daten durch aktives Sampling.
+    """
+    def __init__(self, d_model, n_domains=4, vocab_size=4096, window_size=500):
+        super().__init__()
+        self.d_model = d_model
+        self.n_domains = n_domains
+        self.window_size = window_size
+        
+        # =====================================================================
+        #  1. UNCERTAINTY SAMPLER
+        # =====================================================================
+        # EMA-Unsicherheit pro Domäne
+        self.register_buffer('domain_uncertainty', torch.zeros(n_domains))
+        self.register_buffer('domain_counts', torch.zeros(n_domains))
+        # Unsicherheits-Verlauf
+        self.register_buffer('uncertainty_history', torch.zeros(window_size))
+        self.register_buffer('uncertainty_ema', torch.zeros(1))
+        self._uncertainty_idx = 0
+        self._ema_decay = 0.95
+        
+        # Token-Unsicherheits-Map (Wissenslücken über den Token-Raum)
+        self.register_buffer('token_uncertainty', torch.zeros(vocab_size))
+        self.register_buffer('token_counts', torch.zeros(vocab_size))
+        
+        # =====================================================================
+        #  2. QUERY MECHANISMUS
+        # =====================================================================
+        self.register_buffer('query_counter', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('queries_history', torch.zeros(window_size))
+        self._query_idx = 0
+        
+        # =====================================================================
+        #  3. CURRICULUM ON DEMAND
+        # =====================================================================
+        self.register_buffer('curriculum_request', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('curriculum_ema', torch.zeros(1))
+        
+        # ——— Metrik ———
+        self.register_buffer('active_sampling_benefit', torch.zeros(window_size))
+        self._benefit_idx = 0
+    
+    # =========================================================================
+    #  1. UNCERTAINTY SAMPLING
+    # =========================================================================
+    
+    def sample_uncertainty(self, error_norm, confidence=None):
+        """
+        Berechne Unsicherheit aus Prediction-Error und Confidenz.
+        
+        Args:
+            error_norm: float — Norm des Prediction-Errors (0..10+)
+            confidence: float oder None — Confidenz-Score (0..1)
+        
+        Returns:
+            uncertainty: float (0..1)
+        """
+        err_unc = min(max(error_norm, 0.0), 10.0) / 10.0
+        if confidence is not None:
+            conf_unc = 1.0 - min(max(confidence, 0.0), 1.0)
+            return min(max(0.6 * err_unc + 0.4 * conf_unc, 0.0), 1.0)
+        return min(max(err_unc, 0.0), 1.0)
+    
+    def learn_step(self, input_ids, error_norm, loss, domain_idx=0, confidence=None):
+        """
+        Aktualisiere Unsicherheits-Map, Wissenslücken und Curriculum-Anfrage.
+        
+        Args:
+            input_ids: [batch, seq] — Tokens des aktuellen Batches
+            error_norm: float — Prediction-Error-Norm
+            loss: float — aktueller Loss
+            domain_idx: int — aktuelle Domäne (0=text, 1=code, 2=security, 3=network)
+            confidence: float oder None — Confidenz aus SelfReflection
+        """
+        with torch.no_grad():
+            unc = self.sample_uncertainty(error_norm, confidence)
+            
+            # Domänen-Unsicherheit (EMA)
+            d = min(domain_idx, self.n_domains - 1)
+            self.domain_uncertainty[d] = self._ema_decay * self.domain_uncertainty[d] + (1 - self._ema_decay) * unc
+            self.domain_counts[d] += 1
+            
+            # Token-Unsicherheit (Wissenslücken) — Stichprobe aus dem Batch
+            flat_tokens = input_ids.reshape(-1)
+            n_tok = flat_tokens.size(0)
+            k = min(n_tok, 64)  # Stichprobe (nicht alle Tokens)
+            sample_idx = flat_tokens[:k]
+            max_tok = self.token_uncertainty.size(0) - 1
+            for tok in sample_idx.cpu().tolist():
+                tok = min(int(tok), max_tok)
+                self.token_uncertainty[tok] = self._ema_decay * self.token_uncertainty[tok] + (1 - self._ema_decay) * unc
+                self.token_counts[tok] += 1
+            
+            # Unsicherheits-Verlauf + EMA
+            idx = self._uncertainty_idx % self.window_size
+            self.uncertainty_history[idx] = unc
+            self._uncertainty_idx += 1
+            self.uncertainty_ema[0] = 0.9 * self.uncertainty_ema[0] + 0.1 * unc
+            
+            # ===============================================================
+            #  CURRICULUM ON DEMAND — Unsicherheits-Trend
+            # ===============================================================
+            if self._uncertainty_idx >= 20:
+                recent = self.uncertainty_history[max(0, idx - 19): idx + 1]
+                avg_recent = recent.mean().item()
+                ema = self.curriculum_ema[0].item()
+                # Steigende Unsicherheit → leichtere Daten anfordern
+                if ema > 0 and avg_recent > ema * 1.3 + 0.05:
+                    self.curriculum_request[0] = -1
+                # Fallende Unsicherheit → schwerere Daten anfordern
+                elif ema > 0 and avg_recent < ema * 0.7 - 0.05:
+                    self.curriculum_request[0] = 1
+                else:
+                    self.curriculum_request[0] = 0
+                self.curriculum_ema[0] = 0.9 * ema + 0.1 * avg_recent
+            
+            # Query-Mechanismus zählt aktives Sampling
+            self.query_counter[0] += 1
+            qidx = self._query_idx % self.window_size
+            self.queries_history[qidx] = unc
+            self._query_idx += 1
+    
+    # =========================================================================
+    #  2. QUERY MECHANISMUS
+    # =========================================================================
+    
+    def get_knowledge_gaps(self, top_k=8):
+        """
+        Finde die unsichersten Tokens = Wissenslücken.
+        
+        Returns:
+            gaps: list[(token_id, uncertainty)] — unsicherste Tokens mit Score
+        """
+        with torch.no_grad():
+            mask = self.token_counts > 5  # Nur Tokens mit genug Daten
+            scores = torch.where(mask, self.token_uncertainty, torch.zeros_like(self.token_uncertainty))
+            n_valid = int(mask.sum().clamp(min=1).item())
+            k = min(top_k, n_valid)
+            if k <= 0:
+                return []
+            top = torch.topk(scores, k=k).indices.cpu().tolist()
+            return [(t, float(self.token_uncertainty[t].item())) for t in top]
+    
+    def get_domain_preference(self):
+        """
+        Empfohlene Domänen-Gewichte für aktives Sampling.
+        
+        Domänen mit HOHER Unsicherheit bekommen MEHR Gewicht
+        (mehr Daten für Wissenslücken — Uncertainty Sampling).
+        
+        Returns:
+            prefs: [n_domains] Tensor (normalisiert)
+        """
+        with torch.no_grad():
+            if int(self.domain_counts.sum().item()) < 10:
+                return torch.ones(self.n_domains, device=self.domain_uncertainty.device) / self.n_domains
+            prefs = self.domain_uncertainty + 0.1  # Smoothing
+            total = prefs.sum().clamp(min=1e-6)
+            return prefs / total
+    
+    def get_curriculum_request(self):
+        """Schwierigkeits-Empfehlung: -1=leichter, 0=gleich, +1=schwerer."""
+        return int(self.curriculum_request[0].item())
+    
+    # =========================================================================
+    #  3. KONDITIONIERUNG
+    # =========================================================================
+    
+    def condition(self, hidden_states):
+        """
+        Sanfte Modulation basierend auf aktueller Unsicherheit (Curiosity-Gain).
+        
+        Bei hoher Unsicherheit: leicht verstärkte Aktivierung
+        (mehr Aufmerksamkeit auf unsichere Bereiche).
+        """
+        with torch.no_grad():
+            if self._uncertainty_idx < 5:
+                return hidden_states
+            unc = float(self.uncertainty_history[min(self._uncertainty_idx - 1, self.window_size - 1)].item())
+            gain = 1.0 + 0.05 * min(max(unc - 0.5, -0.5), 0.5)
+            return hidden_states * gain
+    
+    # =========================================================================
+    #  STATS
+    # =========================================================================
+    
+    def get_active_stats(self):
+        """Stats für train_state.json."""
+        last_unc = 0.0
+        if self._uncertainty_idx > 0:
+            last_unc = float(self.uncertainty_history[min(self._uncertainty_idx - 1, self.window_size - 1)].item())
+        return {
+            'uncertainty': last_unc,
+            'uncertainty_ema': float(self.uncertainty_ema[0].item()),
+            'curriculum_request': self.get_curriculum_request(),
+            'n_queries': int(self.query_counter[0].item()),
+            'knowledge_gaps': [t for t, _ in self.get_knowledge_gaps(5)],
+            'domain_uncertainty': [float(x) for x in self.domain_uncertainty.cpu().tolist()],
+            'domain_counts': [int(x) for x in self.domain_counts.cpu().tolist()],
         }
 
 
@@ -6412,6 +6689,7 @@ class CogLang:
         self._hierarchical_memory = None
         self._hierarchical_goal = None
         self._meta_learning = None
+        self._active_learning = None
         # PHASE 15: Efficiency
         self.mp = MixedPrecisionManager(use_mixed_precision)
 
@@ -6532,6 +6810,13 @@ class CogLang:
         m = MetaLearning(d_model, n_hyperparams, n_strategy_dim, window_size)
         self.modules.append(m)
         self._meta_learning = m
+        return m
+
+    def ActiveLearning(self, d_model, n_domains=4, vocab_size=4096, window_size=500):
+        """PHASE 56: Aktives Lernen — Uncertainty-Sampler, Query-Mechanismus, Curriculum-on-Demand."""
+        m = ActiveLearning(d_model, n_domains, vocab_size, window_size)
+        self.modules.append(m)
+        self._active_learning = m
         return m
 
     def SecurityHead(self, d_model, d_sparse, n_cwe_types=20):
@@ -6845,6 +7130,18 @@ class CogLang:
             # Im Lernmodus nur loss tracken
             self._meta_learning.update_loss_trend(getattr(self, '_current_loss', 10.0))
         
+        # PHASE 56: Aktives Lernen — Unsicherheits-basierte Modulation (Curiosity-Gain)
+        if self._active_learning is not None:
+            pred = self._active_learning.condition(pred)
+            if not learn:
+                al_stats = self._active_learning.get_active_stats()
+                info_extra['active_learning'] = {
+                    'uncertainty': al_stats['uncertainty'],
+                    'curriculum_request': al_stats['curriculum_request'],
+                    'n_queries': al_stats['n_queries'],
+                    'knowledge_gaps': al_stats['knowledge_gaps'],
+                }
+        
         # PHASE 39: Tool Use — Erkenne und führe Tool-Aufrufe aus
         if self._tool_use is not None and not learn:
             # Dekodiere Output in Text (grobe Approximation)
@@ -6979,6 +7276,30 @@ class CogLang:
                 self._meta_learn_counter += 1
                 if self._meta_learn_counter % 100 == 0:
                     self._meta_learning.learn_from_strategy_history()
+            
+            # PHASE 56: Aktives Lernen — Unsicherheit sammeln, Wissenslücken + Curriculum
+            if self._active_learning is not None and info.get('errors') is not None:
+                err_norm = sum((e ** 2).mean().item() for e in info['errors']) / max(1, len(info['errors']))
+                conf = None
+                reflection = info.get('reflection')
+                if reflection and 'avg_confidence' in reflection:
+                    conf = reflection['avg_confidence']
+                domain_idx = getattr(self, '_current_domain', 0)
+                self._active_learning.learn_step(
+                    input_ids, err_norm, loss.item(), domain_idx, confidence=conf,
+                )
+                info['active_learning'] = {
+                    'uncertainty': float(self._active_learning.uncertainty_history[
+                        min(max(self._active_learning._uncertainty_idx - 1, 0), self._active_learning.window_size - 1)
+                    ].item()),
+                    'curriculum_request': self._active_learning.get_curriculum_request(),
+                    'knowledge_gaps': self._active_learning.get_knowledge_gaps(5),
+                }
+                # PHASE 57: Meta-Learning × Active-Learning Kopplung —
+                # Unsicherheit moduliert die Hyperparameter-Steuerung
+                if self._meta_learning is not None:
+                    unc_signal = float(self._active_learning.uncertainty_ema[0].item())
+                    self._meta_learning.adapt_from_uncertainty(unc_signal)
             
             # PHASE 48: MetaKognition learn_step — Kalibrierung + Strategie-Lernen
             if self._metakognition is not None:
@@ -7307,6 +7628,7 @@ def build_anima(vocab_size=62, device='cuda', d_model=512, d_sparse=4096, n_laye
     brain.HierarchicalMemory(d_model=d_sparse, sensory_buffer_size=1000, working_mem_size=256, episodic_buffer_size=500)
     brain.HierarchicalGoal(d_model=d_sparse, max_goals=32, max_subgoals_per_goal=8, max_depth=4)
     brain.MetaLearning(d_model=d_sparse, n_hyperparams=5, n_strategy_dim=32, window_size=200)
+    brain.ActiveLearning(d_model=d_sparse, n_domains=4, vocab_size=vocab_size, window_size=500)
     brain.to(device)
     precision = "FP16/FP32 Mixed" if brain.mp.enabled else "FP32"
     print(f'CogLang v3 AGI: {brain.parameter_count()/1e6:.1f}M Parameter | {precision} | d_model={d_model}, n_layers={n_layers}, memory={memory_size}, attn={n_attention_heads}, rules={n_rules}, ES={es_population}, skills={n_skills}')

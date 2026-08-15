@@ -660,6 +660,14 @@ def run_evolution():
                 current_lr = base_lr * warmup_factor * 3.0
             else:
                 current_lr = cosine_anneal_lr(base_lr, step - 5000, steps_per_iter * 2)
+            
+            # PHASE 57: Meta-Learning × Active-Learning Kopplung —
+            # Unsicherheits-gekoppelte LR-Skala anwenden (begrenzt auf 0.5x..2.0x)
+            if hasattr(brain, '_meta_learning') and brain._meta_learning is not None:
+                meta_hp = brain._meta_learning.get_hyperparams()
+                meta_scale = min(max(meta_hp['lr_scale'], 0.5), 2.0)
+                current_lr = current_lr * meta_scale
+            
             for layer_idx, layer in enumerate(brain._stack.layers):
                 # Hebbian LR is divided by (batch*seq)=1024 internally → lr_eff must be ~0.01
                 # So layer._lr must be ~10 for lr_eff ~0.01
